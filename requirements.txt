@@ -1,0 +1,8 @@
+# Core dependencies
+litellm
+pyyaml
+requests
+
+# GUI (optional — only needed for start-litellm-gui.py)
+# Install with: pip install PySide6
+PySide6
