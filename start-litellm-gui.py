@@ -669,7 +669,12 @@ class LiteLLMGui(QMainWindow):
         self._apply_stylesheet()
         self._populate_profiles()
         self._start_loading_models()
-        # Check if a proxy is already running on the default port
+
+        self._flash_state = False
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setInterval(500)
+        self._flash_timer.timeout.connect(self._tick_status_flash)
+
         QTimer.singleShot(100, self._check_existing_proxy)
 
     # ── UI Setup ──────────────────────────────────────────────────────
@@ -838,6 +843,22 @@ class LiteLLMGui(QMainWindow):
         self.setStyleSheet(_stylesheet())
 
     # ── Model Loading ─────────────────────────────────────────────────
+
+    def _set_status(self, text: str, style: str, flashing: bool = False) -> None:
+        self._flash_timer.stop()
+        self.status_indicator.setText(text)
+        self.status_indicator.setObjectName(style)
+        self.status_indicator.style().unpolish(self.status_indicator)
+        self.status_indicator.style().polish(self.status_indicator)
+        if flashing:
+            self._flash_state = True
+            self._flash_timer.start()
+
+    def _tick_status_flash(self) -> None:
+        self._flash_state = not self._flash_state
+        dot = "●" if self._flash_state else "○"
+        current = self.status_indicator.text()
+        self.status_indicator.setText(dot + current[1:])
 
     def _start_loading_models(self) -> None:
         if getattr(self, "_fetching", False):
@@ -1072,10 +1093,7 @@ class LiteLLMGui(QMainWindow):
 
     def _on_proxy_detected(self) -> None:
         self._proxy_running = True
-        self.status_indicator.setText("●  Connected (detected)")
-        self.status_indicator.setObjectName("good")
-        self.status_indicator.style().unpolish(self.status_indicator)
-        self.status_indicator.style().polish(self.status_indicator)
+        self._set_status("●  Connected (detected)", "good")
         self.launch_btn.setEnabled(False)
         self.kill_btn.setEnabled(True)
         self.open_terminal_btn.setEnabled(True)
@@ -1124,6 +1142,7 @@ class LiteLLMGui(QMainWindow):
 
         self._log(f"Starting LiteLLM on port {self._port}...")
         self.launch_btn.setEnabled(False)
+        self._set_status("●  Connecting...", "warn", flashing=True)
 
         # Use signal-based worker
         self._launch_worker = ProxyLauncher(self._port)
@@ -1135,25 +1154,23 @@ class LiteLLMGui(QMainWindow):
     def _on_proxy_ready(self, pid: int) -> None:
         self._litellm_pid = pid
         self._proxy_running = True
-        self.status_indicator.setText("●  Connected")
-        self.status_indicator.setObjectName("good")
-        self.status_indicator.style().unpolish(self.status_indicator)
-        self.status_indicator.style().polish(self.status_indicator)
+        self._set_status("●  Connected", "good")
         self.launch_btn.setEnabled(False)
         self.kill_btn.setEnabled(True)
         self.open_terminal_btn.setEnabled(True)
         self.latency_btn.setEnabled(True)
         self._log(f"LiteLLM is running on port {self._port} (PID {self._litellm_pid}).")
-        # Update CLAUDE.md routing table
         self._update_claude_md()
 
     def _on_proxy_failed(self, err_text: str) -> None:
+        self._set_status("●  Disconnected", "bad")
         self.launch_btn.setEnabled(True)
         self._log(f"Proxy failed to start:\n{err_text}")
 
     def _kill_proxy(self) -> None:
         self._log(f"Killing proxy on port {self._port}...")
         self.kill_btn.setEnabled(False)
+        self._set_status("●  Disconnecting...", "warn", flashing=True)
         self._killer = ProxyKiller(self._port)
         self._killer_thread = threading.Thread(target=self._killer.run, daemon=True)
         self._killer.done.connect(self._on_proxy_killed)
@@ -1161,10 +1178,7 @@ class LiteLLMGui(QMainWindow):
 
     def _on_proxy_killed(self) -> None:
         self._proxy_running = False
-        self.status_indicator.setText("●  Disconnected")
-        self.status_indicator.setObjectName("bad")
-        self.status_indicator.style().unpolish(self.status_indicator)
-        self.status_indicator.style().polish(self.status_indicator)
+        self._set_status("●  Disconnected", "bad")
         self.launch_btn.setEnabled(True)
         self.kill_btn.setEnabled(False)
         self.open_terminal_btn.setEnabled(False)
