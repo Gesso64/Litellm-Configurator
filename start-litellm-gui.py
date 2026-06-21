@@ -147,6 +147,7 @@ def _stylesheet() -> str:
         QLabel#status {{ font-size: 12px; color: {b['muted']}; padding: 2px 0; background: transparent; }}
         QLabel#good {{ color: {b['good']}; background: transparent; }}
         QLabel#bad {{ color: {b['bad']}; background: transparent; }}
+        QLabel#warn {{ color: {b['warn']}; background: transparent; }}
         QLabel#accent {{ color: {b['accent']}; background: transparent; }}
         QLabel#cost-label {{ font-size: 13px; color: {b['accent_2']}; padding: 4px 0; background: transparent; }}
 
@@ -244,6 +245,11 @@ def find_model_by_id(models: list[dict], model_id: str) -> dict | None:
     return None
 
 
+def _model_supports_vision(model: dict) -> bool:
+    modality = model.get("architecture", {}).get("modality", "")
+    return "image" in modality.lower()
+
+
 def profile_path(name: str) -> Path:
     return PROFILES_DIR / f"{name}.json"
 
@@ -287,10 +293,13 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
     cd_host = f'cd "{project_dir}"; ' if project_dir else ""
     cd_ps = f'Set-Location "{project_dir}"; ' if project_dir else ""
 
+    # All box lines: inner width = 74, total = 76 (║ + 74 chars + ║)
+    B = "══════════════════════════════════════════════════════════════════════════"
     role_lines = []
     for role_key, alias, label in ROLES:
         mid = models.get(role_key, "?")
-        role_lines.append(f"║  {label:10s}  {alias:<18s} →  {mid:<34s} ║")
+        mid_display = (mid[:35] + "..") if len(mid) > 37 else mid
+        role_lines.append(f"║  {label:10s}  {alias:<18s} →  {mid_display:<37s} ║")
     role_block_ps = "".join(f'Write-Host "{line}"; ' for line in role_lines)
     role_block_bash = "".join(f'echo "{line}"; ' for line in role_lines)
 
@@ -301,15 +310,15 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
             f'$env:ANTHROPIC_BASE_URL="{base_url}"; '
             f'$env:ANTHROPIC_API_KEY="sk-local-fake"; '
             f'Write-Host ""; '
-            f'Write-Host "╔══════════════════════════════════════════════════════════════╗"; '
-            f'Write-Host "║               LiteLLM Proxy — Active Models                ║"; '
-            f'Write-Host "╠══════════════════════════════════════════════════════════════╣"; '
+            f'Write-Host "╔{B}╗"; '
+            f'Write-Host "║               LiteLLM Proxy — Active Models                              ║"; '
+            f'Write-Host "╠{B}╣"; '
             f'Write-Host "║  Port: {port:<65} ║"; '
             f'{ps_project_line}'
             f'{role_block_ps}'
-            f'Write-Host "╠══════════════════════════════════════════════════════════════╣"; '
-            f'Write-Host "║  Proxy running in background — env vars are set.            ║"; '
-            f'Write-Host "╚══════════════════════════════════════════════════════════════╝"; '
+            f'Write-Host "╠{B}╣"; '
+            f'Write-Host "║  Proxy running in background — env vars are set.                         ║"; '
+            f'Write-Host "╚{B}╝"; '
             f'Write-Host ""; '
             f'Write-Host "Press Enter to launch Claude Code, or type: claude"; '
             f'Read-Host; '
@@ -326,15 +335,15 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
             f'export ANTHROPIC_BASE_URL="{base_url}"; '
             f'export ANTHROPIC_API_KEY="sk-local-fake"; '
             f'echo ""; '
-            f'echo "╔══════════════════════════════════════════════════════════════╗"; '
-            f'echo "║               LiteLLM Proxy — Active Models                ║"; '
-            f'echo "╠══════════════════════════════════════════════════════════════╣"; '
+            f'echo "╔{B}╗"; '
+            f'echo "║               LiteLLM Proxy — Active Models                              ║"; '
+            f'echo "╠{B}╣"; '
             f'echo "║  Port: {port:<65} ║"; '
             f'{bash_project_line}'
             f'{role_block_bash}'
-            f'echo "╠══════════════════════════════════════════════════════════════╣"; '
-            f'echo "║  Proxy running in background — env vars are set.            ║"; '
-            f'echo "╚══════════════════════════════════════════════════════════════╝"; '
+            f'echo "╠{B}╣"; '
+            f'echo "║  Proxy running in background — env vars are set.                         ║"; '
+            f'echo "╚{B}╝"; '
             f'echo ""; '
             f'read -p "Press Enter to launch Claude Code... "; '
             f'claude'
@@ -399,14 +408,24 @@ class ModelSearchWidget(QFrame):
 
         # Model list
         self.model_list = QListWidget()
-        self.model_list.setMinimumHeight(180)
+        self.model_list.setMinimumHeight(80)
         self.model_list.currentItemChanged.connect(self._on_selection_changed)
-        layout.addWidget(self.model_list)
+        layout.addWidget(self.model_list, stretch=1)
 
         # Selected display
         self.selected_display = QLabel("No model selected")
         self.selected_display.setObjectName("model-display")
         layout.addWidget(self.selected_display)
+
+        self.vision_warn = QLabel("  No image support — Claude Code may send screenshots to this role")
+        self.vision_warn.setObjectName("bad")
+        self.vision_warn.setVisible(False)
+        layout.addWidget(self.vision_warn)
+
+        self.latency_label = QLabel("Latency: —")
+        self.latency_label.setObjectName("status")
+        self.latency_label.setVisible(False)
+        layout.addWidget(self.latency_label)
 
         self._refresh_list()
 
@@ -436,7 +455,10 @@ class ModelSearchWidget(QFrame):
             p_in = float(pricing.get("prompt", 0) or 0)
             p_out = float(pricing.get("completion", 0) or 0)
 
-            display = f"{mid}  |  {name}  |  {ctx_k}  |  ${p_in:.6f}/in  ${p_out:.6f}/out"
+            vision_tag = "[img]" if _model_supports_vision(m) else "     "
+            p_in_m = p_in * 1_000_000
+            p_out_m = p_out * 1_000_000
+            display = f"{vision_tag}  {mid}  [{ctx_k}]  ${p_in_m:.2f}/${p_out_m:.2f} per 1M"
             item = QListWidgetItem(display)
             item.setData(Qt.UserRole, mid)
             self.model_list.addItem(item)
@@ -459,12 +481,15 @@ class ModelSearchWidget(QFrame):
         mid = current.data(Qt.UserRole)
         self._selected_id = mid
         self.selected_display.setText(mid)
+        m = find_model_by_id(self._all_models, mid)
+        self.vision_warn.setVisible(m is not None and not _model_supports_vision(m))
         self.model_selected.emit(mid)
 
     def set_selected(self, model_id: str) -> None:
         self._selected_id = model_id
         self.selected_display.setText(model_id or "No model selected")
-        # Highlight in list
+        m = find_model_by_id(self._all_models, model_id)
+        self.vision_warn.setVisible(m is not None and not _model_supports_vision(m))
         for i in range(self.model_list.count()):
             if self.model_list.item(i).data(Qt.UserRole) == model_id:
                 self.model_list.setCurrentRow(i)
@@ -472,6 +497,33 @@ class ModelSearchWidget(QFrame):
 
     def selected_model(self) -> str | None:
         return self._selected_id
+
+    def supports_vision(self) -> bool:
+        if not self._selected_id:
+            return True
+        m = find_model_by_id(self._all_models, self._selected_id)
+        return _model_supports_vision(m) if m else True
+
+    def set_latency(self, ms: float | None, error: str | None = None) -> None:
+        self.latency_label.setVisible(ms is not None or error is not None)
+        if error:
+            self.latency_label.setText("Latency: error")
+            obj = "bad"
+        elif ms is None:
+            self.latency_label.setText("Latency: —")
+            obj = "status"
+        elif ms < 3000:
+            self.latency_label.setText(f"Latency: {ms:.0f} ms")
+            obj = "good"
+        elif ms < 8000:
+            self.latency_label.setText(f"Latency: {ms:.0f} ms")
+            obj = "warn"
+        else:
+            self.latency_label.setText(f"Latency: {ms:.0f} ms")
+            obj = "bad"
+        self.latency_label.setObjectName(obj)
+        self.latency_label.style().unpolish(self.latency_label)
+        self.latency_label.style().polish(self.latency_label)
 
 
 # ── Main Window ───────────────────────────────────────────────────────
@@ -555,6 +607,42 @@ class ProxyLauncher(QObject):
                 self.failed.emit(err_text)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class LatencyTester(QObject):
+    """Worker that sends a minimal request to each role and measures round-trip time."""
+    result = Signal(str, float)  # role_key, ms
+    error = Signal(str, str)     # role_key, error message
+
+    def __init__(self, port: int, role_key: str, alias: str, parent=None):
+        super().__init__(parent)
+        self._port = port
+        self._role_key = role_key
+        self._model = alias if alias != "claude-*" else "claude-ping-test"
+
+    @Slot()
+    def run(self) -> None:
+        payload = json.dumps({
+            "model": self._model,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 1,
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://localhost:{self._port}/v1/chat/completions",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer sk-local-fake",
+            },
+        )
+        try:
+            start = time.perf_counter()
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp.read()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            self.result.emit(self._role_key, elapsed_ms)
+        except Exception as exc:
+            self.error.emit(self._role_key, str(exc))
 
 
 class LiteLLMGui(QMainWindow):
@@ -728,6 +816,11 @@ class LiteLLMGui(QMainWindow):
         self.open_terminal_btn.clicked.connect(self._open_terminal)
         action_row.addWidget(self.open_terminal_btn)
 
+        self.latency_btn = QPushButton("Test Latency")
+        self.latency_btn.setEnabled(False)
+        self.latency_btn.clicked.connect(self._test_latency)
+        action_row.addWidget(self.latency_btn)
+
         action_row.addStretch()
         right_layout.addLayout(action_row)
 
@@ -801,7 +894,8 @@ class LiteLLMGui(QMainWindow):
         if m is None:
             return ("—", None)
         p_in = float(m.get("pricing", {}).get("prompt", 0) or 0)
-        return (f"${p_in:.6f}", p_in)
+        p_in_m = p_in * 1_000_000
+        return (f"${p_in_m:.2f}/1M", p_in_m)
 
     def _update_cost_display(self) -> None:
         if not self._models:
@@ -819,9 +913,9 @@ class LiteLLMGui(QMainWindow):
             parts.append(f"{role_key}: {cost_str}")
             if cost_val is not None:
                 total += cost_val
-        total_str = f"${total:.6f}" if total > 0 else "?"
+        total_str = f"${total:.2f}/1M" if total > 0 else "?"
         self.cost_label.setText(
-            "  |  ".join(parts) + f"  —  Total: {total_str}/1M input"
+            "  |  ".join(parts) + f"  —  Total: {total_str} input tokens"
         )
 
     # ── Profile Management ────────────────────────────────────────────
@@ -977,6 +1071,7 @@ class LiteLLMGui(QMainWindow):
         self.launch_btn.setEnabled(False)
         self.kill_btn.setEnabled(True)
         self.open_terminal_btn.setEnabled(True)
+        self.latency_btn.setEnabled(True)
         self._log(f"Detected existing proxy on port {self._port}.")
         self._log("  (Kill it or launch a new one on a different port.)")
 
@@ -1005,8 +1100,13 @@ class LiteLLMGui(QMainWindow):
             self._log("ERROR: Select models for at least Advisor and Agent.")
             return
 
+        vision_support = {
+            "advisor": self.advisor_widget.supports_vision(),
+            "agent": self.agent_widget.supports_vision(),
+            "subagent": self.subagent_widget.supports_vision(),
+        }
         self._log("Generating LiteLLM config...")
-        generate_yaml(models)
+        generate_yaml(models, vision_support=vision_support)
         self._log(f"  Wrote {YAML_PATH}")
 
         # Check if port is taken
@@ -1034,6 +1134,7 @@ class LiteLLMGui(QMainWindow):
         self.launch_btn.setEnabled(False)
         self.kill_btn.setEnabled(True)
         self.open_terminal_btn.setEnabled(True)
+        self.latency_btn.setEnabled(True)
         self._log(f"LiteLLM is running on port {self._port} (PID {self._litellm_pid}).")
         # Update CLAUDE.md routing table
         self._update_claude_md()
@@ -1059,6 +1160,9 @@ class LiteLLMGui(QMainWindow):
         self.launch_btn.setEnabled(True)
         self.kill_btn.setEnabled(False)
         self.open_terminal_btn.setEnabled(False)
+        self.latency_btn.setEnabled(False)
+        for w in [self.advisor_widget, self.agent_widget, self.subagent_widget]:
+            w.set_latency(None)
         self._log("Proxy stopped.")
 
     def _open_terminal(self) -> None:
@@ -1070,6 +1174,48 @@ class LiteLLMGui(QMainWindow):
         project_dir = self._project_dir
         self._log("Opening terminal with proxy env vars set...")
         open_terminal_with_env(models, self._port, project_dir)
+
+    def _test_latency(self) -> None:
+        self.latency_btn.setEnabled(False)
+        self._pending_latency = len(ROLES)
+        for w in [self.advisor_widget, self.agent_widget, self.subagent_widget]:
+            w.latency_label.setText("Latency: testing…")
+            w.latency_label.setObjectName("status")
+            w.latency_label.style().unpolish(w.latency_label)
+            w.latency_label.style().polish(w.latency_label)
+        self._log("Testing latency for each role...")
+        self._latency_workers = []
+        for role_key, alias, _ in ROLES:
+            worker = LatencyTester(self._port, role_key, alias)
+            thread = threading.Thread(target=worker.run, daemon=True)
+            worker.result.connect(self._on_latency_result)
+            worker.error.connect(self._on_latency_error)
+            self._latency_workers.append(worker)
+            thread.start()
+
+    def _on_latency_result(self, role_key: str, ms: float) -> None:
+        widget_map = {
+            "advisor": self.advisor_widget,
+            "agent": self.agent_widget,
+            "subagent": self.subagent_widget,
+        }
+        widget_map[role_key].set_latency(ms)
+        self._log(f"  {role_key}: {ms:.0f} ms")
+        self._pending_latency -= 1
+        if self._pending_latency <= 0:
+            self.latency_btn.setEnabled(True)
+
+    def _on_latency_error(self, role_key: str, err: str) -> None:
+        widget_map = {
+            "advisor": self.advisor_widget,
+            "agent": self.agent_widget,
+            "subagent": self.subagent_widget,
+        }
+        widget_map[role_key].set_latency(None, error=err)
+        self._log(f"  {role_key}: error — {err[:120]}")
+        self._pending_latency -= 1
+        if self._pending_latency <= 0:
+            self.latency_btn.setEnabled(True)
 
     def _update_claude_md(self) -> None:
         models = {

@@ -84,19 +84,22 @@ def find_litellm() -> str | None:
     return None
 
 
-def generate_yaml(models: dict, yaml_path: Path = YAML_PATH) -> None:
+def generate_yaml(models: dict, yaml_path: Path = YAML_PATH, vision_support: dict | None = None) -> None:
     import yaml
     model_list = []
     for role_key, alias, _ in ROLES:
         full_id = models.get(role_key, "")
         model_id = full_id.removeprefix("~")
-        model_list.append({
+        entry: dict = {
             "model_name": alias,
             "litellm_params": {
                 "model": f"openrouter/{model_id}",
                 "api_key": "os.environ/OPENROUTER_API_KEY",
             },
-        })
+        }
+        if vision_support is not None:
+            entry["model_info"] = {"supports_vision": vision_support.get(role_key, False)}
+        model_list.append(entry)
     config = {
         "model_list": model_list,
         "general_settings": {"master_key": "sk-local-fake"},
