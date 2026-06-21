@@ -13,18 +13,15 @@ import time
 import urllib.request
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".claude"
+from litellm_utils import (
+    CONFIG_DIR, ROLES, YAML_PATH,
+    find_litellm, generate_yaml, health_check, kill_process_on_port,
+    update_claude_md,
+)
+
 SCRIPTS_DIR = Path.home() / ".claude" / "scripts"
 PROFILES_DIR = CONFIG_DIR / "profiles"
-YAML_PATH = CONFIG_DIR / "litellm-select.yaml"
 CLAUDE_MD_PATH = CONFIG_DIR / "CLAUDE.md"
-
-# Role definitions: (key, claude_alias, display_label)
-ROLES = [
-    ("advisor", "claude-opus-4-7", "Advisor"),
-    ("agent", "claude-sonnet-4-6", "Agent"),
-    ("subagent", "claude-*", "Subagent"),
-]
 
 DEFAULT_MODELS = {
     "advisor": "~anthropic/claude-opus-latest",
@@ -223,111 +220,22 @@ def delete_profile(name: str) -> None:
         path.unlink()
 
 
-def generate_yaml(models: dict) -> None:
-    import yaml
-    model_list = []
-    for role_key, alias, _ in ROLES:
-        full_id = models.get(role_key, "")
-        # Skip leading ~ for the yaml
-        model_id = full_id.lstrip("~")
-        model_list.append({
-            "model_name": alias,
-            "litellm_params": {
-                "model": f"openrouter/{model_id}",
-                "api_key": "os.environ/OPENROUTER_API_KEY",
-            },
-        })
-    litellm_settings: dict = {"drop_params": True}
-
-    config = {
-        "model_list": model_list,
-        "general_settings": {"master_key": "sk-local-fake"},
-        "litellm_settings": litellm_settings,
-    }
-    with open(YAML_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-
-
-def health_check(port: int, timeout: int = 10) -> bool:
-    url = f"http://localhost:{port}/health/liveliness"
-    for _ in range(timeout):
-        try:
-            with urllib.request.urlopen(url, timeout=2) as resp:
-                if resp.status == 200:
-                    return True
-        except Exception:
-            pass
-        time.sleep(1)
-    return False
-
-
-def kill_process_on_port(port: int) -> bool:
-    if platform.system() == "Windows":
-        try:
-            out = subprocess.check_output(
-                f'netstat -ano | findstr "LISTENING" | findstr ":{port}"',
-                shell=True, text=True, timeout=5,
-            )
-            for line in out.strip().splitlines():
-                parts = line.strip().split()
-                if parts:
-                    pid = parts[-1]
-                    subprocess.run(["taskkill", "/F", "/PID", pid],
-                                   capture_output=True, timeout=5)
-        except Exception:
-            return False
-    else:
-        try:
-            subprocess.run(["pkill", "-f", f"litellm.*--port {port}"],
-                           capture_output=True, timeout=5)
-        except Exception:
-            return False
-    time.sleep(2)
-    return not health_check(port, timeout=3)
-
-
-def find_litellm() -> str | None:
-    """Return path to litellm executable, preferring project venv first."""
-    # Prefer project-local venv
-    script_dir = Path(__file__).parent
-    venv_dir = script_dir / ".venv"
-    if venv_dir.exists():
-        for candidate in [
-            venv_dir / "Scripts" / "litellm.exe",
-            venv_dir / "Scripts" / "litellm",
-            venv_dir / "bin" / "litellm",
-        ]:
-            if candidate.exists():
-                return str(candidate)
-    try:
-        if platform.system() == "Windows":
-            result = subprocess.run(["where", "litellm"], capture_output=True, text=True, timeout=5)
-        else:
-            result = subprocess.run(["which", "litellm"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            return result.stdout.strip().splitlines()[0]
-    except Exception:
-        pass
-    return None
-
-
 def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> None:
     """Open a new terminal window with the proxy env vars set and claude command ready."""
     base_url = f"http://localhost:{port}"
 
-    # Optional cd into project dir
-    cd_cmd = f'cd "{project_dir}" && ' if project_dir else ""
     cd_host = f'cd "{project_dir}"; ' if project_dir else ""
     cd_ps = f'Set-Location "{project_dir}"; ' if project_dir else ""
 
-    # Build a role summary string
     role_lines = []
     for role_key, alias, label in ROLES:
         mid = models.get(role_key, "?")
         role_lines.append(f"║  {label:10s}  {alias:<18s} →  {mid:<34s} ║")
+    role_block_ps = "".join(f'Write-Host "{line}"; ' for line in role_lines)
+    role_block_bash = "".join(f'echo "{line}"; ' for line in role_lines)
 
     if platform.system() == "Windows":
-        ps_project_line = (f'Write-Host "║  Project: {project_dir,-62} ║"; ') if project_dir else ""
+        ps_project_line = (f'Write-Host "║  Project: {project_dir:<62} ║"; ') if project_dir else ""
         ps_command = (
             f'{cd_ps}'
             f'$env:ANTHROPIC_BASE_URL="{base_url}"; '
@@ -336,11 +244,9 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
             f'Write-Host "╔══════════════════════════════════════════════════════════════╗"; '
             f'Write-Host "║               LiteLLM Proxy — Active Models                ║"; '
             f'Write-Host "╠══════════════════════════════════════════════════════════════╣"; '
-            f'Write-Host "║  Port: {port,-65} ║"; '
+            f'Write-Host "║  Port: {port:<65} ║"; '
             f'{ps_project_line}'
-            f'Write-Host "{role_lines[0]}"; '
-            f'Write-Host "{role_lines[1]}"; '
-            f'Write-Host "{role_lines[2]}"; '
+            f'{role_block_ps}'
             f'Write-Host "╠══════════════════════════════════════════════════════════════╣"; '
             f'Write-Host "║  Proxy running in background — env vars are set.            ║"; '
             f'Write-Host "╚══════════════════════════════════════════════════════════════╝"; '
@@ -363,11 +269,9 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
             f'echo "╔══════════════════════════════════════════════════════════════╗"; '
             f'echo "║               LiteLLM Proxy — Active Models                ║"; '
             f'echo "╠══════════════════════════════════════════════════════════════╣"; '
-            f'echo "║  Port: {port}"; '
+            f'echo "║  Port: {port:<65} ║"; '
             f'{bash_project_line}'
-            f'echo "{role_lines[0]}"; '
-            f'echo "{role_lines[1]}"; '
-            f'echo "{role_lines[2]}"; '
+            f'{role_block_bash}'
             f'echo "╠══════════════════════════════════════════════════════════════╣"; '
             f'echo "║  Proxy running in background — env vars are set.            ║"; '
             f'echo "╚══════════════════════════════════════════════════════════════╝"; '
@@ -376,7 +280,6 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
             f'claude'
         )
         if platform.system() == "Darwin":
-            # macOS: use osascript to open Terminal.app
             escaped = bash_script.replace('"', '\\"')
             subprocess.Popen(
                 ["osascript", "-e",
@@ -384,7 +287,6 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
                 shell=False,
             )
         else:
-            # Linux: try common terminal emulators in order of preference
             for term_cmd in [
                 ["x-terminal-emulator", "-e", "bash", "-c", bash_script],
                 ["gnome-terminal", "--", "bash", "-c", bash_script],
@@ -528,6 +430,37 @@ class ModelLoader(QObject):
             self.error.emit(str(exc))
 
 
+class ProxyChecker(QObject):
+    """Worker that checks if a proxy is already running on the given port."""
+    found = Signal()
+    not_found = Signal()
+
+    def __init__(self, port: int, parent=None):
+        super().__init__(parent)
+        self._port = port
+
+    @Slot()
+    def run(self) -> None:
+        if health_check(self._port, timeout=2):
+            self.found.emit()
+        else:
+            self.not_found.emit()
+
+
+class ProxyKiller(QObject):
+    """Worker that kills the proxy on the given port off the GUI thread."""
+    done = Signal()
+
+    def __init__(self, port: int, parent=None):
+        super().__init__(parent)
+        self._port = port
+
+    @Slot()
+    def run(self) -> None:
+        kill_process_on_port(self._port)
+        self.done.emit()
+
+
 class ProxyLauncher(QObject):
     """Worker object that starts LiteLLM and emits ready/failed signals."""
     ready = Signal(int)  # PID
@@ -543,14 +476,15 @@ class ProxyLauncher(QObject):
         pid_path = Path(tempfile.gettempdir()) / "litellm-gui.pid"
         try:
             litellm_cmd = find_litellm() or "litellm"
-            proc = subprocess.Popen(
-                [litellm_cmd, "--config", str(YAML_PATH), "--port", str(self._port)],
-                env={**os.environ, "PYTHONIOENCODING": "utf-8",
-                     "PYTHONUTF8": "1", "SSLKEYLOGFILE": ""},
-                stdout=open(log_path, "w"),
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            with open(log_path, "w") as log_fh:
+                proc = subprocess.Popen(
+                    [litellm_cmd, "--config", str(YAML_PATH), "--port", str(self._port)],
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8",
+                         "PYTHONUTF8": "1", "SSLKEYLOGFILE": ""},
+                    stdout=log_fh,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
             pid_path.write_text(str(proc.pid))
 
             if health_check(self._port):
@@ -638,11 +572,11 @@ class LiteLLMGui(QMainWindow):
         self.status_indicator.setObjectName("bad")
         header_row.addWidget(self.status_indicator)
 
-        refresh_btn = QPushButton("⟳ Reload Models")
-        refresh_btn.setObjectName("accent")
-        refresh_btn.setFixedWidth(130)
-        refresh_btn.clicked.connect(self._start_loading_models)
-        header_row.addWidget(refresh_btn)
+        self.refresh_btn = QPushButton("⟳ Reload Models")
+        self.refresh_btn.setObjectName("accent")
+        self.refresh_btn.setFixedWidth(130)
+        self.refresh_btn.clicked.connect(self._start_loading_models)
+        header_row.addWidget(self.refresh_btn)
 
         right_layout.addLayout(header_row)
 
@@ -668,7 +602,6 @@ class LiteLLMGui(QMainWindow):
         self.project_dir_input.textChanged.connect(self._on_project_dir_changed)
         proj_row.addWidget(self.project_dir_input, stretch=1)
         browse_btn = QPushButton("Browse…")
-        browse_btn.setFixedWidth(80)
         browse_btn.clicked.connect(self._browse_project_dir)
         proj_row.addWidget(browse_btn)
         right_layout.addLayout(proj_row)
@@ -734,8 +667,11 @@ class LiteLLMGui(QMainWindow):
     # ── Model Loading ─────────────────────────────────────────────────
 
     def _start_loading_models(self) -> None:
+        if getattr(self, "_fetching", False):
+            return
         self._log("Fetching models from OpenRouter...")
         self._fetching = True
+        self.refresh_btn.setEnabled(False)
         self._show_loading_state(True)
 
         self._loader = ModelLoader()
@@ -759,6 +695,7 @@ class LiteLLMGui(QMainWindow):
 
     def _on_model_error(self, err: str) -> None:
         self._fetching = False
+        self.refresh_btn.setEnabled(True)
         self._show_loading_state(False)
         self._log(f"ERROR: {err}")
         self._log("Set OPENROUTER_API_KEY as a system env var and restart.")
@@ -766,6 +703,7 @@ class LiteLLMGui(QMainWindow):
     def _on_models_loaded(self, models: list[dict]) -> None:
         self._models = models
         self._fetching = False
+        self.refresh_btn.setEnabled(True)
         self._show_loading_state(False)
         self._log(f"Loaded {len(self._models)} models from OpenRouter.")
 
@@ -781,10 +719,6 @@ class LiteLLMGui(QMainWindow):
 
     def _on_model_changed(self, role_key: str, model_id: str) -> None:
         self._current_models[role_key] = model_id
-        # Auto-copy agent to subagent if subagent hasn't been explicitly changed
-        if role_key == "agent":
-            # Only auto-set if subagent currently equals the previous agent default
-            pass  # user can set independently
 
     # ── Profile Management ────────────────────────────────────────────
 
@@ -822,6 +756,9 @@ class LiteLLMGui(QMainWindow):
         self.subagent_widget.set_selected(models.get("subagent", ""))
 
         self._log(f"Loaded profile '{data.get('name', '?')}'")
+        if self._proxy_running:
+            self._log("  ⚠  Proxy is still running with the old config — kill and relaunch to apply changes.")
+            self._log("  ⚠  Any open terminals need to be reopened to pick up the new settings.")
         # Recheck proxy on the profile's port
         QTimer.singleShot(200, self._check_existing_proxy)
 
@@ -873,18 +810,24 @@ class LiteLLMGui(QMainWindow):
     # ── Detect existing proxy ──────────────────────────────────────────
 
     def _check_existing_proxy(self) -> None:
-        """Check if a LiteLLM proxy is already running on the current port."""
-        if health_check(self._port, timeout=2):
-            self._proxy_running = True
-            self.status_indicator.setText("●  Connected (detected)")
-            self.status_indicator.setObjectName("good")
-            self.status_indicator.style().unpolish(self.status_indicator)
-            self.status_indicator.style().polish(self.status_indicator)
-            self.launch_btn.setEnabled(False)
-            self.kill_btn.setEnabled(True)
-            self.open_terminal_btn.setEnabled(True)
-            self._log(f"Detected existing proxy on port {self._port}.")
-            self._log("  (Kill it or launch a new one on a different port.)")
+        """Check if a LiteLLM proxy is already running on the current port (off-thread)."""
+        port = self._port
+        self._checker = ProxyChecker(port)
+        self._checker_thread = threading.Thread(target=self._checker.run, daemon=True)
+        self._checker.found.connect(self._on_proxy_detected)
+        self._checker_thread.start()
+
+    def _on_proxy_detected(self) -> None:
+        self._proxy_running = True
+        self.status_indicator.setText("●  Connected (detected)")
+        self.status_indicator.setObjectName("good")
+        self.status_indicator.style().unpolish(self.status_indicator)
+        self.status_indicator.style().polish(self.status_indicator)
+        self.launch_btn.setEnabled(False)
+        self.kill_btn.setEnabled(True)
+        self.open_terminal_btn.setEnabled(True)
+        self._log(f"Detected existing proxy on port {self._port}.")
+        self._log("  (Kill it or launch a new one on a different port.)")
 
     # ── Proxy Launch / Kill ───────────────────────────────────────────
 
@@ -950,7 +893,13 @@ class LiteLLMGui(QMainWindow):
 
     def _kill_proxy(self) -> None:
         self._log(f"Killing proxy on port {self._port}...")
-        kill_process_on_port(self._port)
+        self.kill_btn.setEnabled(False)
+        self._killer = ProxyKiller(self._port)
+        self._killer_thread = threading.Thread(target=self._killer.run, daemon=True)
+        self._killer.done.connect(self._on_proxy_killed)
+        self._killer_thread.start()
+
+    def _on_proxy_killed(self) -> None:
         self._proxy_running = False
         self.status_indicator.setText("●  Disconnected")
         self.status_indicator.setObjectName("bad")
@@ -977,29 +926,13 @@ class LiteLLMGui(QMainWindow):
             "agent": self.agent_widget.selected_model() or "",
             "subagent": self.subagent_widget.selected_model() or "",
         }
-        lines = [
-            "Update the model routing table in CLAUDE.md:",
-            f"- claude-sonnet-4-6 -> {models['agent']} (Agent)",
-            f"- claude-opus-4-7 -> {models['advisor']} (Advisor)",
-            f"- claude-* -> {models['subagent']} (Subagent)",
-            "",
-            "Specifically update the table rows under '## LiteLLM Proxy (OpenRouter)'.",
-            "Keep all other sections unchanged.",
-        ]
-        instruction = "\n".join(lines)
-        cloud_doc = SCRIPTS_DIR / "cloud-doc.py"
-        if not cloud_doc.exists():
+        result = update_claude_md(models, self._port)
+        if result is None:
             self._log("  [warn] cloud-doc.py not found; update CLAUDE.md routing table manually.")
-            return
-        try:
-            subprocess.run(
-                [sys.executable, str(cloud_doc), str(CLAUDE_MD_PATH), instruction,
-                 "--model", "claude-opus-4-7", "--port", str(self._port)],
-                check=True, capture_output=True, text=True, timeout=60,
-            )
+        elif result is True:
             self._log("  Updated CLAUDE.md routing table.")
-        except subprocess.CalledProcessError as exc:
-            self._log(f"  [warn] Failed to update CLAUDE.md: {exc.stderr[:200] if exc.stderr else str(exc)}")
+        else:
+            self._log(f"  [warn] Failed to update CLAUDE.md: {result[:200]}")
 
 
 # ── Entry ─────────────────────────────────────────────────────────────

@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,18 +12,15 @@ import time
 import urllib.request
 from pathlib import Path
 
-SCRIPTS_DIR = Path.home() / ".claude" / "scripts"
-CONFIG_DIR = Path.home() / ".claude"
-PROFILES_DIR = CONFIG_DIR / "profiles"
-YAML_PATH = CONFIG_DIR / "litellm-select.yaml"
-CLAUDE_MD_PATH = CONFIG_DIR / "CLAUDE.md"
+from litellm_utils import (
+    CONFIG_DIR, ROLES, YAML_PATH,
+    find_litellm, generate_yaml, health_check, kill_process_on_port,
+    update_claude_md,
+)
 
-# (role_key, model_name_alias, display_label)
-ROLES = [
-    ("advisor", "claude-opus-4-7", "Advisor"),
-    ("agent", "claude-sonnet-4-6", "Agent"),
-    ("subagent", "claude-*", "Subagent"),
-]
+SCRIPTS_DIR = Path.home() / ".claude" / "scripts"
+PROFILES_DIR = CONFIG_DIR / "profiles"
+CLAUDE_MD_PATH = CONFIG_DIR / "CLAUDE.md"
 
 DEFAULT_MODELS = {
     "advisor": "anthropic/claude-opus-latest",
@@ -135,6 +130,9 @@ def interactive_select(models: list[dict], role: str, alias: str, default: str |
                 mid = selected.get("id", "")
                 print(f"  => {role}: {mid}")
                 return mid
+            else:
+                print(f"  Enter a number between 1 and {total}.")
+                continue
 
         # Treat as new search filter
         query = inp
@@ -180,112 +178,6 @@ def list_profiles() -> list[tuple[str, dict]]:
     return result
 
 
-def generate_yaml(models: dict) -> None:
-    import yaml
-    model_list = []
-    for role_key, alias, _ in ROLES:
-        model_list.append({
-            "model_name": alias,
-            "litellm_params": {
-                "model": f"openrouter/{models[role_key]}",
-                "api_key": "os.environ/OPENROUTER_API_KEY",
-            },
-        })
-    config = {
-        "model_list": model_list,
-        "general_settings": {"master_key": "sk-local-fake"},
-        "litellm_settings": {"drop_params": True},
-    }
-    with open(YAML_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
-    print(f"  Wrote {YAML_PATH}")
-
-
-def update_claude_md(models: dict, port: int) -> None:
-    lines = [
-        "Update the model routing table in CLAUDE.md:",
-        f"- claude-sonnet-4-6 -> {models['agent']} (Agent)",
-        f"- claude-opus-4-7 -> {models['advisor']} (Advisor)",
-        f"- claude-* -> {models['subagent']} (Subagent)",
-        "",
-        "Specifically update the table rows under '## LiteLLM Proxy (OpenRouter)'.",
-        "Keep all other sections unchanged.",
-    ]
-    instruction = "\n".join(lines)
-    cloud_doc = SCRIPTS_DIR / "cloud-doc.py"
-    if not cloud_doc.exists():
-        print("  [warn] cloud-doc.py not found; update CLAUDE.md routing table manually.")
-        print(f"  New routing: {models}")
-        return
-    try:
-        subprocess.run(
-            [sys.executable, str(cloud_doc), str(CLAUDE_MD_PATH), instruction,
-             "--model", "claude-opus-4-7", "--port", str(port)],
-            check=True, capture_output=True, text=True, timeout=60,
-        )
-        print("  Updated CLAUDE.md routing table.")
-    except subprocess.CalledProcessError as exc:
-        print(f"  [warn] cloud-doc.py failed to update CLAUDE.md.")
-        print(f"  stderr: {exc.stderr[:300]}" if exc.stderr else "")
-        print(f"  New routing — update manually in CLAUDE.md:")
-        for role_key, alias, label in ROLES:
-            print(f"    {alias} -> {models[role_key]}")
-
-
-def _venv_litellm() -> str | None:
-    """Return path to litellm inside the project's .venv if it exists."""
-    script_dir = Path(__file__).parent
-    venv_dir = script_dir / ".venv"
-    if not venv_dir.exists():
-        return None
-    for candidate in [
-        venv_dir / "Scripts" / "litellm.exe",
-        venv_dir / "Scripts" / "litellm",
-        venv_dir / "bin" / "litellm",
-    ]:
-        if candidate.exists():
-            return str(candidate)
-    return None
-
-
-def health_check(port: int, timeout: int = 15) -> bool:
-    url = f"http://localhost:{port}/health/liveliness"
-    for _ in range(timeout):
-        try:
-            with urllib.request.urlopen(url, timeout=2) as resp:
-                if resp.status == 200:
-                    return True
-        except Exception:
-            pass
-        time.sleep(1)
-    return False
-
-
-def kill_process_on_port(port: int) -> bool:
-    if platform.system() == "Windows":
-        try:
-            out = subprocess.check_output(
-                f'netstat -ano | findstr "LISTENING" | findstr ":{port}"',
-                shell=True, text=True, timeout=5,
-            )
-            for line in out.strip().splitlines():
-                parts = line.strip().split()
-                if parts:
-                    pid = parts[-1]
-                    subprocess.run(["taskkill", "/F", "/PID", pid],
-                                   capture_output=True, timeout=5)
-        except Exception:
-            return False
-    else:
-        try:
-            subprocess.run(["pkill", "-f", f"litellm.*--port {port}"],
-                           capture_output=True, timeout=5)
-        except Exception:
-            return False
-    time.sleep(2)
-    return not health_check(port, timeout=3)
-
-
 def launch_litellm(config_path: Path, port: int) -> None:
     if health_check(port, timeout=1):
         print(f"  Port {port} already has a LiteLLM running.")
@@ -300,22 +192,22 @@ def launch_litellm(config_path: Path, port: int) -> None:
             print("  Keeping existing. Use --no-launch to just generate config.")
             return
 
-    # Prefer project venv's litellm over system PATH
-    litellm_cmd = _venv_litellm() or "litellm"
+    litellm_cmd = find_litellm() or "litellm"
 
     print(f"  Starting LiteLLM on port {port}...")
     log_path = Path(tempfile.gettempdir()) / "litellm-select.log"
     pid_path = Path(tempfile.gettempdir()) / "litellm-select.pid"
 
     try:
-        proc = subprocess.Popen(
-            [litellm_cmd, "--config", str(config_path), "--port", str(port)],
-            env={**os.environ, "PYTHONIOENCODING": "utf-8",
-                 "PYTHONUTF8": "1", "SSLKEYLOGFILE": ""},
-            stdout=open(log_path, "w"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        with open(log_path, "w") as log_fh:
+            proc = subprocess.Popen(
+                [litellm_cmd, "--config", str(config_path), "--port", str(port)],
+                env={**os.environ, "PYTHONIOENCODING": "utf-8",
+                     "PYTHONUTF8": "1", "SSLKEYLOGFILE": ""},
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
     except FileNotFoundError:
         die("litellm not found. Install with: pip install litellm (or use the project .venv)")
 
@@ -404,10 +296,21 @@ def main() -> None:
 
     print("\nGenerating LiteLLM config...")
     generate_yaml(models)
+    print(f"  Wrote {YAML_PATH}")
 
     if not args.no_launch:
         launch_litellm(YAML_PATH, port)
-        update_claude_md(models, port)
+        result = update_claude_md(models, port)
+        if result is None:
+            print("  [warn] cloud-doc.py not found; update CLAUDE.md routing table manually.")
+            for role_key, alias, label in ROLES:
+                print(f"    {alias} -> {models[role_key]}")
+        elif result is True:
+            print("  Updated CLAUDE.md routing table.")
+        else:
+            print(f"  [warn] Failed to update CLAUDE.md: {result[:300]}")
+            for role_key, alias, label in ROLES:
+                print(f"    {alias} -> {models[role_key]}")
         # --- Persistent model banner ---
         print()
         print("╔══════════════════════════════════════════════════════════════╗")
