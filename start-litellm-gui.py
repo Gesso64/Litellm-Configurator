@@ -578,6 +578,8 @@ class LiteLLMGui(QMainWindow):
         self._apply_stylesheet()
         self._populate_profiles()
         self._start_loading_models()
+        # Check if a proxy is already running on the default port
+        QTimer.singleShot(100, self._check_existing_proxy)
 
     # ── UI Setup ──────────────────────────────────────────────────────
 
@@ -820,6 +822,8 @@ class LiteLLMGui(QMainWindow):
         self.subagent_widget.set_selected(models.get("subagent", ""))
 
         self._log(f"Loaded profile '{data.get('name', '?')}'")
+        # Recheck proxy on the profile's port
+        QTimer.singleShot(200, self._check_existing_proxy)
 
     def _save_profile_dialog(self) -> None:
         name, ok = QInputDialog.getText(self, "Save Profile", "Profile name:")
@@ -865,6 +869,22 @@ class LiteLLMGui(QMainWindow):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Project Directory")
         if dir_path:
             self.project_dir_input.setText(dir_path)
+
+    # ── Detect existing proxy ──────────────────────────────────────────
+
+    def _check_existing_proxy(self) -> None:
+        """Check if a LiteLLM proxy is already running on the current port."""
+        if health_check(self._port, timeout=2):
+            self._proxy_running = True
+            self.status_indicator.setText("●  Connected (detected)")
+            self.status_indicator.setObjectName("good")
+            self.status_indicator.style().unpolish(self.status_indicator)
+            self.status_indicator.style().polish(self.status_indicator)
+            self.launch_btn.setEnabled(False)
+            self.kill_btn.setEnabled(True)
+            self.open_terminal_btn.setEnabled(True)
+            self._log(f"Detected existing proxy on port {self._port}.")
+            self._log("  (Kill it or launch a new one on a different port.)")
 
     # ── Proxy Launch / Kill ───────────────────────────────────────────
 

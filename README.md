@@ -79,6 +79,7 @@ python start-litellm-select.py
 | `--list-profiles` | List all saved profiles |
 | `--delete-profile NAME` | Delete a saved profile |
 | `--no-launch` | Generate config only, don't start the proxy |
+| `--project-dir PATH` | CD to this directory in the terminal (also persisted in profiles) |
 
 After launching, a persistent banner shows the active model routing:
 
@@ -112,6 +113,10 @@ run.bat gui
 ```bash
 python start-litellm-gui.py
 ```
+
+When opened, the GUI auto-detects a running LiteLLM proxy on the current port
+and transitions to the "Connected" state — so you can see status at a glance
+and jump straight to using it.
 
 Requires `PySide6` (included in `requirements.txt` — installs into `.venv`).
 
