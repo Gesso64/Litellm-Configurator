@@ -29,6 +29,64 @@ DEFAULT_MODELS = {
     "subagent": "deepseek/deepseek-v4-flash",
 }
 
+PRESETS: list[dict] = [
+    {
+        "name": "★ Uncompromising",
+        "models": {
+            "advisor": "anthropic/claude-opus-4.8",
+            "agent": "anthropic/claude-opus-4.8-fast",
+            "subagent": "google/gemini-3.5-flash",
+        },
+        "port": 4001,
+        "project_dir": "",
+        "est_cost": "$16.50/1M in",
+    },
+    {
+        "name": "★ Sweet Spot",
+        "models": {
+            "advisor": "anthropic/claude-opus-4.8",
+            "agent": "~anthropic/claude-sonnet-latest",
+            "subagent": "deepseek/deepseek-v4-flash",
+        },
+        "port": 4001,
+        "project_dir": "",
+        "est_cost": "$8.09/1M in",
+    },
+    {
+        "name": "★ Cost-Conscious",
+        "models": {
+            "advisor": "~anthropic/claude-sonnet-latest",
+            "agent": "deepseek/deepseek-v4-pro",
+            "subagent": "deepseek/deepseek-v4-flash",
+        },
+        "port": 4001,
+        "project_dir": "",
+        "est_cost": "$3.53/1M in",
+    },
+    {
+        "name": "★ Speed Demon",
+        "models": {
+            "advisor": "~anthropic/claude-sonnet-latest",
+            "agent": "google/gemini-3.5-flash",
+            "subagent": "deepseek/deepseek-v4-flash",
+        },
+        "port": 4001,
+        "project_dir": "",
+        "est_cost": "$4.59/1M in",
+    },
+    {
+        "name": "★ Solo Dev",
+        "models": {
+            "advisor": "qwen/qwen3.7-max",
+            "agent": "qwen/qwen3.7-plus",
+            "subagent": "deepseek/deepseek-v4-flash",
+        },
+        "port": 4001,
+        "project_dir": "",
+        "est_cost": "$1.66/1M in",
+    },
+]
+
 PALETTE = {
     "bg": "#0f1419",
     "panel": "#171e25",
@@ -90,6 +148,7 @@ def _stylesheet() -> str:
         QLabel#good {{ color: {b['good']}; background: transparent; }}
         QLabel#bad {{ color: {b['bad']}; background: transparent; }}
         QLabel#accent {{ color: {b['accent']}; background: transparent; }}
+        QLabel#cost-label {{ font-size: 13px; color: {b['accent_2']}; padding: 4px 0; background: transparent; }}
 
         QLineEdit {{ background-color: {b['panel_2']}; color: {b['text']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 6px 10px; font-size: 13px; }}
         QLineEdit:focus {{ border: 1px solid {b['accent']}; }}
@@ -109,6 +168,7 @@ def _stylesheet() -> str:
         QListWidget::item {{ padding: 8px 10px; border-radius: 4px; }}
         QListWidget::item:selected {{ background-color: {b['panel_3']}; color: {b['accent']}; }}
         QListWidget::item:hover {{ background-color: {b['panel_2']}; }}
+        QListWidget::item:disabled {{ color: {b['muted']}; font-style: italic; font-size: 12px; }}
 
         QPlainTextEdit {{ background-color: {b['panel']}; color: {b['muted']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 8px; font-family: 'Consolas', monospace; font-size: 12px; }}
         QFrame#card {{ background-color: {b['panel']}; border: 1px solid {b['line']}; border-radius: 8px; padding: 12px; }}
@@ -502,6 +562,7 @@ class LiteLLMGui(QMainWindow):
         super().__init__()
         self._models: list[dict] = []
         self._profiles: list[tuple[str, dict]] = []
+        self._profile_item_is_preset: dict[int, bool] = {}
         self._litellm_pid: int | None = None
         self._proxy_running = False
         self._port = 4001
@@ -624,6 +685,17 @@ class LiteLLMGui(QMainWindow):
 
         right_layout.addLayout(cards_layout, stretch=1)
 
+        # ── Cost Summary Bar ──
+        cost_frame = QFrame()
+        cost_frame.setObjectName("card")
+        cost_layout = QHBoxLayout(cost_frame)
+        cost_layout.setContentsMargins(14, 8, 14, 8)
+        self.cost_label = QLabel("Cost: select models to calculate")
+        self.cost_label.setObjectName("cost-label")
+        cost_layout.addWidget(self.cost_label)
+        cost_layout.addStretch()
+        right_layout.addWidget(cost_frame)
+
         # ── Log / Status area ──
         status_lbl = QLabel("Proxy Log")
         status_lbl.setObjectName("role-label")
@@ -716,26 +788,96 @@ class LiteLLMGui(QMainWindow):
         self.advisor_widget.set_selected(DEFAULT_MODELS.get("advisor", ""))
         self.agent_widget.set_selected(DEFAULT_MODELS.get("agent", ""))
         self.subagent_widget.set_selected(DEFAULT_MODELS.get("subagent", ""))
+        self._update_cost_display()
 
     def _on_model_changed(self, role_key: str, model_id: str) -> None:
         self._current_models[role_key] = model_id
+        self._update_cost_display()
+
+    # ── Cost Calculator ──────────────────────────────────────────────────
+
+    def _lookup_cost(self, model_id: str) -> tuple[str, float | None]:
+        m = find_model_by_id(self._models, model_id)
+        if m is None:
+            return ("—", None)
+        p_in = float(m.get("pricing", {}).get("prompt", 0) or 0)
+        return (f"${p_in:.6f}", p_in)
+
+    def _update_cost_display(self) -> None:
+        if not self._models:
+            self.cost_label.setText("Cost: select models to calculate")
+            return
+        parts = []
+        total = 0.0
+        for role_key, widget in [
+            ("Advisor", self.advisor_widget),
+            ("Agent", self.agent_widget),
+            ("Subagent", self.subagent_widget),
+        ]:
+            mid = widget.selected_model()
+            cost_str, cost_val = self._lookup_cost(mid)
+            parts.append(f"{role_key}: {cost_str}")
+            if cost_val is not None:
+                total += cost_val
+        total_str = f"${total:.6f}" if total > 0 else "?"
+        self.cost_label.setText(
+            "  |  ".join(parts) + f"  —  Total: {total_str}/1M input"
+        )
 
     # ── Profile Management ────────────────────────────────────────────
 
     def _populate_profiles(self) -> None:
         self.profile_list.blockSignals(True)
         self.profile_list.clear()
+        self._profile_item_is_preset = {}
+
+        row = 0
+        # Built-in presets
+        for preset in PRESETS:
+            item = QListWidgetItem(preset["name"])
+            item.setData(Qt.UserRole, preset["name"])
+            f = item.font()
+            f.setBold(True)
+            item.setFont(f)
+            self.profile_list.addItem(item)
+            self._profile_item_is_preset[row] = True
+            row += 1
+
+        # Separator
+        sep_item = QListWidgetItem("── Saved ──")
+        sep_item.setFlags(Qt.NoItemFlags)
+        sep_item.setForeground(self.palette().color(self.palette().ColorRole.WindowText).darker(180))
+        sep_item.setData(Qt.UserRole, "__separator__")
+        self.profile_list.addItem(sep_item)
+        self._profile_item_is_preset[row] = False  # not used but tracked
+        row += 1
+
+        # User-saved profiles
         self._profiles = list_profiles()
         for name, data in self._profiles:
             item = QListWidgetItem(name)
             item.setData(Qt.UserRole, name)
             self.profile_list.addItem(item)
+            self._profile_item_is_preset[row] = False
+            row += 1
+
         self.profile_list.blockSignals(False)
 
     def _on_profile_selected(self, current, previous) -> None:
         if current is None:
             return
         name = current.data(Qt.UserRole)
+        if name == "__separator__":
+            return
+
+        row = self.profile_list.row(current)
+        if self._profile_item_is_preset.get(row, False):
+            for preset in PRESETS:
+                if preset["name"] == name:
+                    self._load_profile_data(preset)
+                    break
+            return
+
         for pname, data in self._profiles:
             if pname == name:
                 self._load_profile_data(data)
@@ -756,6 +898,7 @@ class LiteLLMGui(QMainWindow):
         self.subagent_widget.set_selected(models.get("subagent", ""))
 
         self._log(f"Loaded profile '{data.get('name', '?')}'")
+        self._update_cost_display()
         if self._proxy_running:
             self._log("  ⚠  Proxy is still running with the old config — kill and relaunch to apply changes.")
             self._log("  ⚠  Any open terminals need to be reopened to pick up the new settings.")
@@ -779,6 +922,14 @@ class LiteLLMGui(QMainWindow):
         if current is None:
             return
         name = current.data(Qt.UserRole)
+        if name == "__separator__":
+            return
+        row = self.profile_list.row(current)
+        if self._profile_item_is_preset.get(row, False):
+            QMessageBox.information(self, "Built-in Preset",
+                                    "This is a built-in preset and cannot be deleted.\n"
+                                    "Save a new profile with your own models instead.")
+            return
         reply = QMessageBox.question(
             self, "Delete Profile",
             f"Delete profile '{name}'?",
