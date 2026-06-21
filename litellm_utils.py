@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -109,30 +110,68 @@ def generate_yaml(models: dict, yaml_path: Path = YAML_PATH, vision_support: dic
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
-def build_claude_md_instruction(models: dict) -> str:
-    lines = [
-        "Update the model routing table in CLAUDE.md:",
-        f"- claude-sonnet-4-6 -> {models['agent']} (Agent)",
-        f"- claude-opus-4-7 -> {models['advisor']} (Advisor)",
-        f"- claude-* -> {models['subagent']} (Subagent)",
-        "",
-        "Specifically update the table rows under '## LiteLLM Proxy (OpenRouter)'.",
-        "Keep all other sections unchanged.",
-    ]
-    return "\n".join(lines)
+_ROUTING_START = "<!-- litellm-routing-start -->"
+_ROUTING_END = "<!-- litellm-routing-end -->"
 
 
-def update_claude_md(models: dict, port: int) -> None:
-    instruction = build_claude_md_instruction(models)
-    cloud_doc = SCRIPTS_DIR / "cloud-doc.py"
-    if not cloud_doc.exists():
-        return None  # caller decides how to warn
+def _build_routing_block(models: dict) -> str:
+    advisor = models.get("advisor", "—").removeprefix("~")
+    agent = models.get("agent", "—").removeprefix("~")
+    subagent = models.get("subagent", "—").removeprefix("~")
+    return "\n".join([
+        _ROUTING_START,
+        "| Alias | Maps to | Role |",
+        "|-------|---------|------|",
+        f"| claude-opus-4-7 | {advisor} | Advisor |",
+        f"| claude-sonnet-4-6 | {agent} | Agent |",
+        f"| claude-* | {subagent} | Subagent |",
+        _ROUTING_END,
+    ])
+
+
+def update_claude_md(models: dict, port: int) -> bool | str:
+    """Directly rewrite the LiteLLM routing table in CLAUDE.md — no LLM needed."""
     try:
-        subprocess.run(
-            [sys.executable, str(cloud_doc), str(CLAUDE_MD_PATH), instruction,
-             "--model", "claude-opus-4-7", "--port", str(port)],
-            check=True, capture_output=True, text=True, timeout=60,
+        block = _build_routing_block(models)
+
+        if not CLAUDE_MD_PATH.exists():
+            CLAUDE_MD_PATH.write_text(
+                f"## LiteLLM Proxy (OpenRouter)\n\n{block}\n", encoding="utf-8"
+            )
+            return True
+
+        content = CLAUDE_MD_PATH.read_text(encoding="utf-8")
+
+        # Case 1: markers already present — replace between them
+        if _ROUTING_START in content and _ROUTING_END in content:
+            new_content = re.sub(
+                re.escape(_ROUTING_START) + r".*?" + re.escape(_ROUTING_END),
+                block,
+                content,
+                flags=re.DOTALL,
+            )
+            CLAUDE_MD_PATH.write_text(new_content, encoding="utf-8")
+            return True
+
+        # Case 2: section header exists but no markers — insert block after header
+        section_re = re.compile(
+            r"(## LiteLLM Proxy \(OpenRouter\)[^\n]*\n)(\s*)(.*?)(?=\n## |\Z)",
+            re.DOTALL,
+        )
+        if section_re.search(content):
+            new_content = section_re.sub(
+                lambda m: m.group(1) + "\n" + block + "\n",
+                content,
+            )
+            CLAUDE_MD_PATH.write_text(new_content, encoding="utf-8")
+            return True
+
+        # Case 3: no section at all — append it
+        sep = "\n\n" if not content.endswith("\n\n") else ""
+        CLAUDE_MD_PATH.write_text(
+            content + sep + f"## LiteLLM Proxy (OpenRouter)\n\n{block}\n",
+            encoding="utf-8",
         )
         return True
-    except subprocess.CalledProcessError as exc:
-        return exc.stderr or ""
+    except Exception as exc:
+        return str(exc)
