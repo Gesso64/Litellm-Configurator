@@ -16,21 +16,28 @@ This tool lets you route [Claude Code](https://docs.anthropic.com/en/docs/claude
 
 - **Python 3.10+**
 - An **OpenRouter API key** — [get one here](https://openrouter.ai/keys)
-- **LiteLLM** installed globally (`pip install litellm`) — needed at runtime to launch the proxy
 - **Claude Code** installed ([docs](https://docs.anthropic.com/en/docs/claude-code))
 
 ## Installation
+
+All dependencies install into a **project-local virtual environment** (`.venv/`). No global pip installs needed.
 
 ```bash
 # 1. Clone the repo
 git clone https://github.com/your-username/Litellm-Configurator.git
 cd Litellm-Configurator
 
-# 2. Install Python dependencies
-pip install -r requirements.txt
+# 2. Create the virtual environment and install dependencies
+python -m venv .venv
+
+# Windows:
+.venv\Scripts\pip install -r requirements.txt
+
+# macOS / Linux:
+.venv/bin/pip install -r requirements.txt
 
 # If you don't need the GUI, you can skip PySide6:
-pip install litellm pyyaml requests
+#   pip install litellm pyyaml requests
 
 # 3. Set your OpenRouter API key
 # Windows (PowerShell):
@@ -41,6 +48,8 @@ export OPENROUTER_API_KEY="your_key_here"
 
 # Or copy .env.example to .env and fill it in (for permanent setup)
 ```
+
+> **Note:** The `.bat` launchers (`run.bat` / `run-gui.bat`) automate the venv setup — they auto-create `.venv` and install deps on first run if missing. The Python scripts also prefer the local `.venv`'s `litellm` binary when launching the proxy.
 
 ## Usage
 
@@ -71,6 +80,27 @@ python start-litellm-select.py
 | `--delete-profile NAME` | Delete a saved profile |
 | `--no-launch` | Generate config only, don't start the proxy |
 
+After launching, a persistent banner shows the active model routing:
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║               LiteLLM Proxy — Active Models                ║
+╠══════════════════════════════════════════════════════════════╣
+║  Port: 4001                                                    ║
+║  Advisor     claude-opus-4-7      →  anthropic/claude-opus-latest ║
+║  Agent       claude-sonnet-4-6    →  deepseek/deepseek-v4-flash  ║
+║  Subagent    claude-*             →  deepseek/deepseek-v4-flash  ║
+╠══════════════════════════════════════════════════════════════╣
+║  Proxy running in background. Use claude with:             ║
+║    ANTHROPIC_BASE_URL=http://localhost:4001                  ║
+║    ANTHROPIC_API_KEY=sk-local-fake                          ║
+╚══════════════════════════════════════════════════════════════╝
+
+Press Enter to dismiss this banner and return to shell...
+```
+
+The banner stays on screen until you press Enter, so you can note the active models before continuing.
+
 ### GUI (desktop app)
 
 **Windows:**
@@ -83,16 +113,18 @@ run.bat gui
 python start-litellm-gui.py
 ```
 
-Requires `PySide6` (`pip install PySide6`).
+Requires `PySide6` (included in `requirements.txt` — installs into `.venv`).
 
 ## How it works
 
-1. Fetches available models from the OpenRouter API using `OPENROUTER_API_KEY`
-2. Presents a type-to-search picker for each role (Advisor, Agent, Subagent)
-3. Optionally saves your selections as a named profile (`~/.claude/profiles/*.json`)
-4. Generates a LiteLLM config at `~/.claude/litellm-select.yaml`
-5. Optionally updates your `~/.claude/CLAUDE.md` routing table
-6. Launches LiteLLM proxy on the chosen port
+1. The launcher auto-creates a project `.venv` (or uses an existing one) and ensures deps are installed
+2. Fetches available models from the OpenRouter API using `OPENROUTER_API_KEY`
+3. Presents a type-to-search picker for each role (Advisor, Agent, Subagent)
+4. Optionally saves your selections as a named profile (`~/.claude/profiles/*.json`)
+5. Generates a LiteLLM config at `~/.claude/litellm-select.yaml`
+6. Optionally updates your `~/.claude/CLAUDE.md` routing table
+7. Launches LiteLLM proxy on the chosen port
+8. Shows a persistent model banner (dismiss on Enter) so you can verify routing before using Claude Code
 
 ## Files
 

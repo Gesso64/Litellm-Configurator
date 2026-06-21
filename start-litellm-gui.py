@@ -54,6 +54,7 @@ try:
         QApplication,
         QComboBox,
         QDialog,
+        QFileDialog,
         QHBoxLayout,
         QInputDialog,
         QLabel,
@@ -203,12 +204,13 @@ def list_profiles() -> list[tuple[str, dict]]:
     return result
 
 
-def save_profile(name: str, port: int, models: dict) -> None:
+def save_profile(name: str, port: int, models: dict, project_dir: str = "") -> None:
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     path = profile_path(name)
     data = {
         "name": name,
         "port": port,
+        "project_dir": project_dir,
         "models": models,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -285,7 +287,18 @@ def kill_process_on_port(port: int) -> bool:
 
 
 def find_litellm() -> str | None:
-    """Return path to litellm executable, or None."""
+    """Return path to litellm executable, preferring project venv first."""
+    # Prefer project-local venv
+    script_dir = Path(__file__).parent
+    venv_dir = script_dir / ".venv"
+    if venv_dir.exists():
+        for candidate in [
+            venv_dir / "Scripts" / "litellm.exe",
+            venv_dir / "Scripts" / "litellm",
+            venv_dir / "bin" / "litellm",
+        ]:
+            if candidate.exists():
+                return str(candidate)
     try:
         if platform.system() == "Windows":
             result = subprocess.run(["where", "litellm"], capture_output=True, text=True, timeout=5)
@@ -298,42 +311,69 @@ def find_litellm() -> str | None:
     return None
 
 
-def open_terminal_with_env(models: dict, port: int) -> None:
+def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> None:
     """Open a new terminal window with the proxy env vars set and claude command ready."""
     base_url = f"http://localhost:{port}"
-    model_id = models.get("agent", "deepseek/deepseek-v4-flash")
+
+    # Optional cd into project dir
+    cd_cmd = f'cd "{project_dir}" && ' if project_dir else ""
+    cd_host = f'cd "{project_dir}"; ' if project_dir else ""
+    cd_ps = f'Set-Location "{project_dir}"; ' if project_dir else ""
+
+    # Build a role summary string
+    role_lines = []
+    for role_key, alias, label in ROLES:
+        mid = models.get(role_key, "?")
+        role_lines.append(f"║  {label:10s}  {alias:<18s} →  {mid:<34s} ║")
 
     if platform.system() == "Windows":
+        ps_project_line = (f'Write-Host "║  Project: {project_dir,-62} ║"; ') if project_dir else ""
         ps_command = (
+            f'{cd_ps}'
             f'$env:ANTHROPIC_BASE_URL="{base_url}"; '
             f'$env:ANTHROPIC_API_KEY="sk-local-fake"; '
-            f'Write-Host "╔══════════════════════════════════════════╗"; '
-            f'Write-Host "║  LiteLLM Proxy Active — Port {port}         ║"; '
-            f'Write-Host "║  Agent: {model_id:<32s} ║"; '
-            f'Write-Host "╚══════════════════════════════════════════╝"; '
             f'Write-Host ""; '
-            f'Write-Host "Type: claude  to launch Claude Code"; '
-            f'Write-Host "Type: exit    to close this terminal"; '
+            f'Write-Host "╔══════════════════════════════════════════════════════════════╗"; '
+            f'Write-Host "║               LiteLLM Proxy — Active Models                ║"; '
+            f'Write-Host "╠══════════════════════════════════════════════════════════════╣"; '
+            f'Write-Host "║  Port: {port,-65} ║"; '
+            f'{ps_project_line}'
+            f'Write-Host "{role_lines[0]}"; '
+            f'Write-Host "{role_lines[1]}"; '
+            f'Write-Host "{role_lines[2]}"; '
+            f'Write-Host "╠══════════════════════════════════════════════════════════════╣"; '
+            f'Write-Host "║  Proxy running in background — env vars are set.            ║"; '
+            f'Write-Host "╚══════════════════════════════════════════════════════════════╝"; '
             f'Write-Host ""; '
+            f'Write-Host "Press Enter to launch Claude Code, or type: claude"; '
+            f'Read-Host; '
             f'claude'
         )
-        # Use start with PowerShell
         subprocess.Popen(
             ["start", "powershell", "-NoExit", "-Command", ps_command],
             shell=True,
         )
     else:
+        bash_project_line = (f'echo "║  Project: {project_dir:<62} ║"; ') if project_dir else ""
         bash_script = (
+            f'{cd_host}'
             f'export ANTHROPIC_BASE_URL="{base_url}"; '
             f'export ANTHROPIC_API_KEY="sk-local-fake"; '
-            f'echo "╔══════════════════════════════════════════╗"; '
-            f'echo "║  LiteLLM Proxy Active — Port {port}         ║"; '
-            f'echo "║  Agent: {model_id}  ║"; '
-            f'echo "╚══════════════════════════════════════════╝"; '
             f'echo ""; '
-            f'echo "Type: claude  to launch Claude Code"; '
+            f'echo "╔══════════════════════════════════════════════════════════════╗"; '
+            f'echo "║               LiteLLM Proxy — Active Models                ║"; '
+            f'echo "╠══════════════════════════════════════════════════════════════╣"; '
+            f'echo "║  Port: {port}"; '
+            f'{bash_project_line}'
+            f'echo "{role_lines[0]}"; '
+            f'echo "{role_lines[1]}"; '
+            f'echo "{role_lines[2]}"; '
+            f'echo "╠══════════════════════════════════════════════════════════════╣"; '
+            f'echo "║  Proxy running in background — env vars are set.            ║"; '
+            f'echo "╚══════════════════════════════════════════════════════════════╝"; '
             f'echo ""; '
-            f'exec $SHELL'
+            f'read -p "Press Enter to launch Claude Code... "; '
+            f'claude'
         )
         if platform.system() == "Darwin":
             # macOS: use osascript to open Terminal.app
@@ -502,8 +542,9 @@ class ProxyLauncher(QObject):
         log_path = Path(tempfile.gettempdir()) / "litellm-gui.log"
         pid_path = Path(tempfile.gettempdir()) / "litellm-gui.pid"
         try:
+            litellm_cmd = find_litellm() or "litellm"
             proc = subprocess.Popen(
-                ["litellm", "--config", str(YAML_PATH), "--port", str(self._port)],
+                [litellm_cmd, "--config", str(YAML_PATH), "--port", str(self._port)],
                 env={**os.environ, "PYTHONIOENCODING": "utf-8",
                      "PYTHONUTF8": "1", "SSLKEYLOGFILE": ""},
                 stdout=open(log_path, "w"),
@@ -530,6 +571,7 @@ class LiteLLMGui(QMainWindow):
         self._litellm_pid: int | None = None
         self._proxy_running = False
         self._port = 4001
+        self._project_dir: str = ""
         self._current_models: dict[str, str] = dict(DEFAULT_MODELS)
 
         self._setup_ui()
@@ -613,6 +655,21 @@ class LiteLLMGui(QMainWindow):
         port_row.addWidget(self.port_input)
         port_row.addStretch()
         right_layout.addLayout(port_row)
+
+        # Project directory row
+        proj_row = QHBoxLayout()
+        proj_lbl = QLabel("Project Dir:")
+        proj_lbl.setObjectName("status")
+        proj_row.addWidget(proj_lbl)
+        self.project_dir_input = QLineEdit()
+        self.project_dir_input.setPlaceholderText("Optional — cd to this dir in the new terminal")
+        self.project_dir_input.textChanged.connect(self._on_project_dir_changed)
+        proj_row.addWidget(self.project_dir_input, stretch=1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setFixedWidth(80)
+        browse_btn.clicked.connect(self._browse_project_dir)
+        proj_row.addWidget(browse_btn)
+        right_layout.addLayout(proj_row)
 
         # ── Role selector cards ──
         cards_layout = QHBoxLayout()
@@ -751,8 +808,11 @@ class LiteLLMGui(QMainWindow):
     def _load_profile_data(self, data: dict) -> None:
         models = data.get("models", {})
         port = data.get("port", 4001)
+        project_dir = data.get("project_dir", "")
         self._port = port
+        self._project_dir = project_dir
         self.port_input.setText(str(port))
+        self.project_dir_input.setText(project_dir)
         self._current_models = dict(models)
 
         self.advisor_widget.set_selected(models.get("advisor", ""))
@@ -769,7 +829,7 @@ class LiteLLMGui(QMainWindow):
                 "agent": self.agent_widget.selected_model() or "",
                 "subagent": self.subagent_widget.selected_model() or "",
             }
-            save_profile(name.strip(), self._port, models)
+            save_profile(name.strip(), self._port, models, self._project_dir)
             self._populate_profiles()
             self._log(f"Saved profile '{name.strip()}'")
 
@@ -795,6 +855,16 @@ class LiteLLMGui(QMainWindow):
             self._port = int(text.strip())
         except ValueError:
             pass
+
+    # ── Project Dir ────────────────────────────────────────────────────
+
+    def _on_project_dir_changed(self, text: str) -> None:
+        self._project_dir = text.strip()
+
+    def _browse_project_dir(self) -> None:
+        dir_path = QFileDialog.getExistingDirectory(self, "Select Project Directory")
+        if dir_path:
+            self.project_dir_input.setText(dir_path)
 
     # ── Proxy Launch / Kill ───────────────────────────────────────────
 
@@ -877,8 +947,9 @@ class LiteLLMGui(QMainWindow):
             "agent": self.agent_widget.selected_model() or "",
             "subagent": self.subagent_widget.selected_model() or "",
         }
+        project_dir = self._project_dir
         self._log("Opening terminal with proxy env vars set...")
-        open_terminal_with_env(models, self._port)
+        open_terminal_with_env(models, self._port, project_dir)
 
     def _update_claude_md(self) -> None:
         models = {

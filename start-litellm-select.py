@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -140,7 +141,7 @@ def interactive_select(models: list[dict], role: str, alias: str, default: str |
         page = 0
 
 
-def save_profile(name: str, port: int, models: dict) -> Path:
+def save_profile(name: str, port: int, models: dict, project_dir: str = "") -> Path:
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     path = PROFILES_DIR / f"{name}.json"
     if path.exists():
@@ -151,6 +152,7 @@ def save_profile(name: str, port: int, models: dict) -> Path:
     data = {
         "name": name,
         "port": port,
+        "project_dir": project_dir,
         "models": models,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
@@ -230,6 +232,22 @@ def update_claude_md(models: dict, port: int) -> None:
             print(f"    {alias} -> {models[role_key]}")
 
 
+def _venv_litellm() -> str | None:
+    """Return path to litellm inside the project's .venv if it exists."""
+    script_dir = Path(__file__).parent
+    venv_dir = script_dir / ".venv"
+    if not venv_dir.exists():
+        return None
+    for candidate in [
+        venv_dir / "Scripts" / "litellm.exe",
+        venv_dir / "Scripts" / "litellm",
+        venv_dir / "bin" / "litellm",
+    ]:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def health_check(port: int, timeout: int = 15) -> bool:
     url = f"http://localhost:{port}/health/liveliness"
     for _ in range(timeout):
@@ -282,13 +300,16 @@ def launch_litellm(config_path: Path, port: int) -> None:
             print("  Keeping existing. Use --no-launch to just generate config.")
             return
 
+    # Prefer project venv's litellm over system PATH
+    litellm_cmd = _venv_litellm() or "litellm"
+
     print(f"  Starting LiteLLM on port {port}...")
     log_path = Path(tempfile.gettempdir()) / "litellm-select.log"
     pid_path = Path(tempfile.gettempdir()) / "litellm-select.pid"
 
     try:
         proc = subprocess.Popen(
-            ["litellm", "--config", str(config_path), "--port", str(port)],
+            [litellm_cmd, "--config", str(config_path), "--port", str(port)],
             env={**os.environ, "PYTHONIOENCODING": "utf-8",
                  "PYTHONUTF8": "1", "SSLKEYLOGFILE": ""},
             stdout=open(log_path, "w"),
@@ -296,7 +317,7 @@ def launch_litellm(config_path: Path, port: int) -> None:
             start_new_session=True,
         )
     except FileNotFoundError:
-        die("litellm not found. Install with: pip install litellm")
+        die("litellm not found. Install with: pip install litellm (or use the project .venv)")
 
     pid_path.write_text(str(proc.pid))
 
@@ -318,6 +339,7 @@ def main() -> None:
     parser.add_argument("--list-profiles", action="store_true", help="List saved profiles and exit")
     parser.add_argument("--delete-profile", help="Delete a saved profile and exit")
     parser.add_argument("--no-launch", action="store_true", help="Generate config but don't start LiteLLM")
+    parser.add_argument("--project-dir", help="Project directory to cd to in the terminal")
     args = parser.parse_args()
 
     if args.list_profiles:
@@ -342,12 +364,21 @@ def main() -> None:
             die(f"Profile '{args.delete_profile}' not found. Available: {', '.join(available) or '(none)'}")
         return
 
+    if args.project_dir:
+        project_dir = str(Path(args.project_dir).resolve())
+        if not Path(project_dir).is_dir():
+            die(f"Project directory does not exist: {project_dir}")
+    else:
+        project_dir = ""
+
     port = args.port
 
     if args.profile:
         profile = load_profile(args.profile)
         models = profile.get("models", {})
         port = profile.get("port", port)
+        if not args.project_dir:
+            project_dir = profile.get("project_dir", project_dir)
         print(f"Loaded profile '{args.profile}':")
         for rk, _, lb in ROLES:
             print(f"  {lb}: {models.get(rk, '?')}")
@@ -369,7 +400,7 @@ def main() -> None:
         if resp == "y":
             name = input("Profile name: ").strip()
             if name:
-                save_profile(name, port, models)
+                save_profile(name, port, models, project_dir)
 
     print("\nGenerating LiteLLM config...")
     generate_yaml(models)
@@ -377,6 +408,24 @@ def main() -> None:
     if not args.no_launch:
         launch_litellm(YAML_PATH, port)
         update_claude_md(models, port)
+        # --- Persistent model banner ---
+        print()
+        print("╔══════════════════════════════════════════════════════════════╗")
+        print("║               LiteLLM Proxy — Active Models                ║")
+        print("╠══════════════════════════════════════════════════════════════╣")
+        print(f"║  Port: {port:<65d} ║")
+        for role_key, alias, label in ROLES:
+            mid = models.get(role_key, "?")
+            print(f"║  {label:10s}  {alias:<18s} →  {mid:<34s} ║")
+        if project_dir:
+            print(f"║  Project: {project_dir:<62s} ║")
+        print("╠══════════════════════════════════════════════════════════════╣")
+        print("║  Proxy running in background. Use claude with:             ║")
+        print(f"║    ANTHROPIC_BASE_URL=http://localhost:{port}               ║")
+        print("║    ANTHROPIC_API_KEY=sk-local-fake                          ║")
+        print("╚══════════════════════════════════════════════════════════════╝")
+        print()
+        input("Press Enter to dismiss this banner and return to shell... ")
     else:
         print("  --no-launch: config written, proxy not started.")
         print(f"  Start manually: litellm --config {YAML_PATH} --port {port}")
