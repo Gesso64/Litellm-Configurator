@@ -105,6 +105,10 @@ def generate_yaml(models: dict, yaml_path: Path = YAML_PATH, vision_support: dic
         "model_list": model_list,
         "general_settings": {"master_key": "sk-local-fake"},
         "litellm_settings": {"drop_params": True},
+        "router_settings": {
+            "allowed_fails": 1000,
+            "cooldown_time": 0,
+        },
     }
     with open(yaml_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)

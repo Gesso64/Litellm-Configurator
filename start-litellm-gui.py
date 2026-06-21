@@ -625,7 +625,8 @@ class LatencyTester(QObject):
         payload = json.dumps({
             "model": self._model,
             "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 1,
+            "max_tokens": 10,
+            "stream": False,
         }).encode("utf-8")
         req = urllib.request.Request(
             f"http://localhost:{self._port}/v1/chat/completions",
@@ -642,7 +643,14 @@ class LatencyTester(QObject):
             elapsed_ms = (time.perf_counter() - start) * 1000
             self.result.emit(self._role_key, elapsed_ms)
         except Exception as exc:
-            self.error.emit(self._role_key, str(exc))
+            body = ""
+            if hasattr(exc, "read"):
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")[:400]
+                except Exception:
+                    pass
+            msg = str(exc) + (f" — {body}" if body else "")
+            self.error.emit(self._role_key, msg)
 
 
 class LiteLLMGui(QMainWindow):
@@ -1212,10 +1220,11 @@ class LiteLLMGui(QMainWindow):
             "subagent": self.subagent_widget,
         }
         widget_map[role_key].set_latency(None, error=err)
-        self._log(f"  {role_key}: error — {err[:120]}")
+        self._log(f"  {role_key}: error — {err[:500]}")
         self._pending_latency -= 1
         if self._pending_latency <= 0:
             self.latency_btn.setEnabled(True)
+            self._log("  Latency errors can put models into cooldown — kill and relaunch the proxy to reset.")
 
     def _update_claude_md(self) -> None:
         models = {
