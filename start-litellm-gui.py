@@ -736,7 +736,6 @@ class LiteLLMGui(QMainWindow):
 
         self.refresh_btn = QPushButton("⟳ Reload Models")
         self.refresh_btn.setObjectName("accent")
-        self.refresh_btn.setFixedWidth(130)
         self.refresh_btn.clicked.connect(self._start_loading_models)
         header_row.addWidget(self.refresh_btn)
 
