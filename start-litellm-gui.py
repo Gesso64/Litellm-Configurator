@@ -22,6 +22,36 @@ from litellm_utils import (
 SCRIPTS_DIR = Path.home() / ".claude" / "scripts"
 PROFILES_DIR = CONFIG_DIR / "profiles"
 CLAUDE_MD_PATH = CONFIG_DIR / "CLAUDE.md"
+SETTINGS_PATH = CONFIG_DIR / "settings.json"
+LITELLM_LOG_PATH = Path(tempfile.gettempdir()) / "litellm-gui.log"
+
+
+def open_path(path: Path) -> bool:
+    """Open a file or directory in the OS file manager / default app. Returns success."""
+    try:
+        if platform.system() == "Windows":
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+        return True
+    except Exception:
+        return False
+
+
+def load_settings() -> dict:
+    if SETTINGS_PATH.exists():
+        try:
+            return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def save_settings(data: dict) -> None:
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 DEFAULT_MODELS = {
     "advisor": "~anthropic/claude-opus-latest",
@@ -104,11 +134,12 @@ PALETTE = {
 
 try:
     from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
-    from PySide6.QtGui import QFont, QFontDatabase, QIcon
+    from PySide6.QtGui import QAction, QFont, QFontDatabase, QIcon, QKeySequence
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
         QDialog,
+        QDialogButtonBox,
         QFileDialog,
         QHBoxLayout,
         QInputDialog,
@@ -153,6 +184,8 @@ def _stylesheet() -> str:
 
         QLineEdit {{ background-color: {b['panel_2']}; color: {b['text']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 6px 10px; font-size: 13px; }}
         QLineEdit:focus {{ border: 1px solid {b['accent']}; }}
+        QLineEdit[invalid="true"] {{ border: 1px solid {b['bad']}; }}
+        QLineEdit[invalid="true"]:focus {{ border: 1px solid {b['bad']}; }}
 
         QPushButton {{ background-color: {b['panel_3']}; color: {b['text']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }}
         QPushButton:hover {{ background-color: {b['line']}; border-color: {b['accent']}; }}
@@ -165,16 +198,26 @@ def _stylesheet() -> str:
         QPushButton#accent:hover {{ background-color: #94baff; }}
         QPushButton:disabled {{ opacity: 0.4; }}
 
-        QListWidget {{ background-color: {b['panel']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 4px; outline: none; }}
-        QListWidget::item {{ padding: 8px 10px; border-radius: 4px; }}
+        QListWidget {{ background-color: {b['panel']}; alternate-background-color: {b['panel_2']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 2px; outline: none; }}
+        QListWidget::item {{ padding: 3px 8px; border: none; }}
         QListWidget::item:selected {{ background-color: {b['panel_3']}; color: {b['accent']}; }}
-        QListWidget::item:hover {{ background-color: {b['panel_2']}; }}
+        QListWidget::item:hover {{ background-color: {b['line']}; }}
         QListWidget::item:disabled {{ color: {b['muted']}; font-style: italic; font-size: 12px; }}
 
         QPlainTextEdit {{ background-color: {b['panel']}; color: {b['muted']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 8px; font-family: 'Consolas', monospace; font-size: 12px; }}
         QFrame#card {{ background-color: {b['panel']}; border: 1px solid {b['line']}; border-radius: 8px; padding: 12px; }}
         QFrame#card-accent {{ background-color: {b['panel']}; border: 1px solid {b['accent']}; border-radius: 8px; padding: 12px; }}
         QFrame#profile-card {{ background-color: {b['panel_2']}; border: 1px solid {b['line']}; border-radius: 8px; padding: 8px; }}
+        QLabel#section-heading {{ font-size: 11px; font-weight: 600; color: {b['muted']}; letter-spacing: 0.5px; text-transform: uppercase; background: transparent; padding-bottom: 2px; }}
+
+        QMenuBar {{ background-color: {b['panel_2']}; color: {b['text']}; border-bottom: 1px solid {b['line']}; padding: 2px; }}
+        QMenuBar::item {{ background: transparent; padding: 6px 12px; border-radius: 4px; }}
+        QMenuBar::item:selected {{ background-color: {b['panel_3']}; color: {b['accent']}; }}
+        QMenuBar::item:pressed {{ background-color: {b['accent']}; color: {b['bg']}; }}
+        QMenu {{ background-color: {b['panel_2']}; color: {b['text']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 4px; }}
+        QMenu::item {{ padding: 6px 24px 6px 16px; border-radius: 4px; }}
+        QMenu::item:selected {{ background-color: {b['panel_3']}; color: {b['accent']}; }}
+        QMenu::separator {{ height: 1px; background: {b['line']}; margin: 4px 8px; }}
 
         /* ── Scrollbars ─────────────────────── */
         QScrollBar:vertical {{
@@ -404,11 +447,14 @@ class ModelSearchWidget(QFrame):
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search models by name or ID…")
         self.search_input.textChanged.connect(self._filter_models)
+        self.search_input.returnPressed.connect(self._select_first_result)
         layout.addWidget(self.search_input)
 
         # Model list
         self.model_list = QListWidget()
         self.model_list.setMinimumHeight(80)
+        self.model_list.setAlternatingRowColors(True)
+        self.model_list.setSpacing(0)
         self.model_list.currentItemChanged.connect(self._on_selection_changed)
         layout.addWidget(self.model_list, stretch=1)
 
@@ -475,6 +521,14 @@ class ModelSearchWidget(QFrame):
     def _filter_models(self) -> None:
         self._refresh_list()
 
+    def _select_first_result(self) -> None:
+        """Pressing Enter in the search box picks the top result."""
+        for i in range(self.model_list.count()):
+            item = self.model_list.item(i)
+            if item.flags() & Qt.ItemIsSelectable:
+                self.model_list.setCurrentRow(i)
+                break
+
     def _on_selection_changed(self, current, previous) -> None:
         if current is None:
             return
@@ -524,6 +578,117 @@ class ModelSearchWidget(QFrame):
         self.latency_label.setObjectName(obj)
         self.latency_label.style().unpolish(self.latency_label)
         self.latency_label.style().polish(self.latency_label)
+
+
+# ── Settings Dialog ───────────────────────────────────────────────────
+
+class SettingsDialog(QDialog):
+    """Modeless settings window — currently holds the OpenRouter API key."""
+
+    api_key_saved = Signal(str)  # emits the key after it is persisted
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Settings")
+        self.setMinimumWidth(520)
+        self.setObjectName("settings-dialog")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
+
+        # ── API Keys section ──
+        api_card = QFrame()
+        api_card.setObjectName("card")
+        api_layout = QVBoxLayout(api_card)
+        api_layout.setSpacing(8)
+
+        api_heading = QLabel("API KEYS")
+        api_heading.setObjectName("section-heading")
+        api_layout.addWidget(api_heading)
+
+        or_lbl = QLabel("OpenRouter API Key")
+        or_lbl.setObjectName("role-label")
+        api_layout.addWidget(or_lbl)
+
+        key_row = QHBoxLayout()
+        key_row.setSpacing(6)
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setPlaceholderText("sk-or-v1-…")
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+        self.api_key_input.textChanged.connect(self._on_api_key_changed)
+        key_row.addWidget(self.api_key_input, stretch=1)
+        self.show_key_btn = QPushButton("Show")
+        self.show_key_btn.clicked.connect(self._toggle_key_visibility)
+        key_row.addWidget(self.show_key_btn)
+        api_layout.addLayout(key_row)
+
+        hint = QLabel("Get a key at openrouter.ai/keys  ·  saved to settings.json")
+        hint.setObjectName("status")
+        api_layout.addWidget(hint)
+
+        self.api_key_status = QLabel("")
+        self.api_key_status.setObjectName("status")
+        api_layout.addWidget(self.api_key_status)
+
+        layout.addWidget(api_card)
+        layout.addStretch()
+
+        # ── Buttons ──
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.close)
+        btn_box.accepted.connect(self.close)
+        layout.addWidget(btn_box)
+
+        # Debounced auto-save
+        self._key_save_timer = QTimer(self)
+        self._key_save_timer.setSingleShot(True)
+        self._key_save_timer.setInterval(600)
+        self._key_save_timer.timeout.connect(self._persist_api_key)
+
+        if parent is not None:
+            self.setStyleSheet(_stylesheet())
+        self._load_api_key()
+
+    def _load_api_key(self) -> None:
+        settings = load_settings()
+        saved_key = settings.get("openrouter_api_key", "")
+        env_key = os.environ.get("OPENROUTER_API_KEY", "")
+        self.api_key_input.blockSignals(True)
+        if env_key:
+            self.api_key_input.setText(env_key)
+            if env_key == saved_key:
+                self.api_key_status.setText("Loaded from settings.json")
+            else:
+                self.api_key_status.setText("Loaded from system environment")
+        elif saved_key:
+            os.environ["OPENROUTER_API_KEY"] = saved_key
+            self.api_key_input.setText(saved_key)
+            self.api_key_status.setText("Loaded from settings.json")
+        else:
+            self.api_key_status.setText("Enter your OpenRouter API key to get started")
+        self.api_key_input.blockSignals(False)
+
+    def _on_api_key_changed(self, text: str) -> None:
+        os.environ["OPENROUTER_API_KEY"] = text.strip()
+        self.api_key_status.setText("Saving…")
+        self._key_save_timer.start()
+
+    def _persist_api_key(self) -> None:
+        key = self.api_key_input.text().strip()
+        settings = load_settings()
+        settings["openrouter_api_key"] = key
+        save_settings(settings)
+        self.api_key_status.setText("Saved" if key else "Key cleared")
+        self.api_key_saved.emit(key)
+
+    def _toggle_key_visibility(self) -> None:
+        if self.api_key_input.echoMode() == QLineEdit.Password:
+            self.api_key_input.setEchoMode(QLineEdit.Normal)
+            self.show_key_btn.setText("Hide")
+        else:
+            self.api_key_input.setEchoMode(QLineEdit.Password)
+            self.show_key_btn.setText("Show")
 
 
 # ── Main Window ───────────────────────────────────────────────────────
@@ -584,7 +749,7 @@ class ProxyLauncher(QObject):
 
     @Slot()
     def run(self) -> None:
-        log_path = Path(tempfile.gettempdir()) / "litellm-gui.log"
+        log_path = LITELLM_LOG_PATH
         pid_path = Path(tempfile.gettempdir()) / "litellm-gui.pid"
         try:
             litellm_cmd = find_litellm() or "litellm"
@@ -661,20 +826,47 @@ class LiteLLMGui(QMainWindow):
         self._profile_item_is_preset: dict[int, bool] = {}
         self._litellm_pid: int | None = None
         self._proxy_running = False
-        self._port = 4001
-        self._project_dir: str = ""
-        self._current_models: dict[str, str] = dict(DEFAULT_MODELS)
+        self._settings_dialog: SettingsDialog | None = None
+        self._loading_session = True  # suppress session writes during construction
+
+        # Heartbeat state
+        self._heartbeat_checker: ProxyChecker | None = None
+        self._heartbeat_inflight = False
+        self._heartbeat_misses = 0
+
+        # Load saved key + session before building UI
+        settings = load_settings()
+        if not os.environ.get("OPENROUTER_API_KEY") and settings.get("openrouter_api_key"):
+            os.environ["OPENROUTER_API_KEY"] = settings["openrouter_api_key"]
+        session = settings.get("session", {})
+        self._port = session.get("port", 4001)
+        self._project_dir = session.get("project_dir", "")
+        self._session_models = session.get("models") or None
+        self._initial_selection_done = False
+        self._current_models: dict[str, str] = dict(self._session_models or DEFAULT_MODELS)
 
         self._setup_ui()
         self._apply_stylesheet()
         self._populate_profiles()
-        self._start_loading_models()
+        self._sync_menu_actions()
 
         self._flash_state = False
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(500)
         self._flash_timer.timeout.connect(self._tick_status_flash)
 
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(5000)
+        self._heartbeat_timer.timeout.connect(self._heartbeat_tick)
+
+        self._loading_session = False
+
+        # First-run: with no API key, open Settings instead of a failed fetch
+        if os.environ.get("OPENROUTER_API_KEY"):
+            self._start_loading_models()
+        else:
+            self._log("No OpenRouter API key found — opening Settings to get you started.")
+            QTimer.singleShot(0, self._open_settings)
         QTimer.singleShot(100, self._check_existing_proxy)
 
     # ── UI Setup ──────────────────────────────────────────────────────
@@ -682,6 +874,8 @@ class LiteLLMGui(QMainWindow):
     def _setup_ui(self) -> None:
         self.setWindowTitle("LiteLLM Configurator")
         self.setMinimumSize(1080, 720)
+
+        self._build_menu_bar()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -758,7 +952,7 @@ class LiteLLMGui(QMainWindow):
         proj_lbl = QLabel("Project Dir:")
         proj_lbl.setObjectName("status")
         proj_row.addWidget(proj_lbl)
-        self.project_dir_input = QLineEdit()
+        self.project_dir_input = QLineEdit(self._project_dir)
         self.project_dir_input.setPlaceholderText("Optional — cd to this dir in the new terminal")
         self.project_dir_input.textChanged.connect(self._on_project_dir_changed)
         proj_row.addWidget(self.project_dir_input, stretch=1)
@@ -797,9 +991,15 @@ class LiteLLMGui(QMainWindow):
         right_layout.addWidget(cost_frame)
 
         # ── Log / Status area ──
+        log_header = QHBoxLayout()
         status_lbl = QLabel("Proxy Log")
         status_lbl.setObjectName("role-label")
-        right_layout.addWidget(status_lbl)
+        log_header.addWidget(status_lbl)
+        log_header.addStretch()
+        open_log_btn = QPushButton("Open Log File")
+        open_log_btn.clicked.connect(self._open_proxy_log)
+        log_header.addWidget(open_log_btn)
+        right_layout.addLayout(log_header)
 
         self.log_area = QPlainTextEdit()
         self.log_area.setReadOnly(True)
@@ -837,6 +1037,182 @@ class LiteLLMGui(QMainWindow):
         right_layout.addLayout(action_row)
 
         root.addWidget(right, stretch=1)
+
+    def _build_menu_bar(self) -> None:
+        bar = self.menuBar()
+
+        # ── File ──
+        file_menu = bar.addMenu("&File")
+
+        save_action = QAction("&Save Profile…", self)
+        save_action.setShortcut(QKeySequence.Save)
+        save_action.triggered.connect(self._save_profile_dialog)
+        file_menu.addAction(save_action)
+
+        reload_action = QAction("&Reload Models", self)
+        reload_action.setShortcut(QKeySequence.Refresh)
+        reload_action.triggered.connect(self._start_loading_models)
+        file_menu.addAction(reload_action)
+
+        file_menu.addSeparator()
+
+        open_config_action = QAction("Open &Config Folder", self)
+        open_config_action.triggered.connect(self._open_config_folder)
+        file_menu.addAction(open_config_action)
+
+        open_log_action = QAction("Open Proxy &Log", self)
+        open_log_action.triggered.connect(self._open_proxy_log)
+        file_menu.addAction(open_log_action)
+
+        file_menu.addSeparator()
+
+        quit_action = QAction("E&xit", self)
+        quit_action.setShortcut(QKeySequence.Quit)
+        quit_action.triggered.connect(self.close)
+        file_menu.addAction(quit_action)
+
+        # ── Edit ──
+        edit_menu = bar.addMenu("&Edit")
+
+        settings_action = QAction("&Settings…", self)
+        settings_action.setShortcut(QKeySequence("Ctrl+,"))
+        settings_action.triggered.connect(self._open_settings)
+        edit_menu.addAction(settings_action)
+
+        # ── Proxy ──
+        proxy_menu = bar.addMenu("&Proxy")
+
+        self.launch_action = QAction("&Launch Proxy", self)
+        self.launch_action.triggered.connect(self._launch_proxy)
+        proxy_menu.addAction(self.launch_action)
+
+        self.kill_action = QAction("&Kill Proxy", self)
+        self.kill_action.triggered.connect(self._kill_proxy)
+        proxy_menu.addAction(self.kill_action)
+
+        proxy_menu.addSeparator()
+
+        self.terminal_action = QAction("Open &Terminal", self)
+        self.terminal_action.triggered.connect(self._open_terminal)
+        proxy_menu.addAction(self.terminal_action)
+
+        # ── Help ──
+        help_menu = bar.addMenu("&Help")
+        about_action = QAction("&About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    def _sync_menu_actions(self) -> None:
+        """Mirror the proxy button enabled-states onto the matching menu actions."""
+        self.launch_action.setEnabled(self.launch_btn.isEnabled())
+        self.kill_action.setEnabled(self.kill_btn.isEnabled())
+        self.terminal_action.setEnabled(self.open_terminal_btn.isEnabled())
+
+    def _open_settings(self) -> None:
+        if self._settings_dialog is None:
+            self._settings_dialog = SettingsDialog(self)
+            self._settings_dialog.api_key_saved.connect(self._on_api_key_saved)
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
+
+    def _on_api_key_saved(self, key: str) -> None:
+        if key:
+            self._log("API key updated — reloading models…")
+            self._start_loading_models()
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self, "About LiteLLM Configurator",
+            "LiteLLM Configurator\n\n"
+            "Pick OpenRouter models for each Claude Code role, manage profiles, "
+            "and launch a local LiteLLM proxy.\n\n"
+            "Set your OpenRouter API key under Edit → Settings.",
+        )
+
+    def _open_config_folder(self) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if not open_path(CONFIG_DIR):
+            self._log(f"Could not open config folder: {CONFIG_DIR}")
+
+    def _open_proxy_log(self) -> None:
+        if not LITELLM_LOG_PATH.exists():
+            self._log("No proxy log yet — launch the proxy first.")
+            QMessageBox.information(
+                self, "No Log Yet",
+                "The proxy log is created the first time you launch the proxy.",
+            )
+            return
+        if not open_path(LITELLM_LOG_PATH):
+            self._log(f"Could not open log file: {LITELLM_LOG_PATH}")
+
+    # ── Session persistence ───────────────────────────────────────────
+
+    def _save_session(self) -> None:
+        """Persist current models/port/project dir, preserving other settings keys."""
+        if self._loading_session:
+            return
+        settings = load_settings()
+        settings["session"] = {
+            "models": {
+                "advisor": self.advisor_widget.selected_model() or "",
+                "agent": self.agent_widget.selected_model() or "",
+                "subagent": self.subagent_widget.selected_model() or "",
+            },
+            "port": self._port,
+            "project_dir": self._project_dir,
+        }
+        save_settings(settings)
+
+    def closeEvent(self, event) -> None:
+        self._save_session()
+        super().closeEvent(event)
+
+    # ── Heartbeat (detect a proxy that died) ──────────────────────────
+
+    def _start_heartbeat(self) -> None:
+        self._heartbeat_misses = 0
+        self._heartbeat_inflight = False
+        self._heartbeat_timer.start()
+
+    def _stop_heartbeat(self) -> None:
+        self._heartbeat_timer.stop()
+        self._heartbeat_inflight = False
+        self._heartbeat_misses = 0
+
+    def _heartbeat_tick(self) -> None:
+        if self._heartbeat_inflight or not self._proxy_running:
+            return
+        self._heartbeat_inflight = True
+        self._heartbeat_checker = ProxyChecker(self._port)
+        self._heartbeat_checker.found.connect(self._on_heartbeat_alive)
+        self._heartbeat_checker.not_found.connect(self._on_heartbeat_miss)
+        threading.Thread(target=self._heartbeat_checker.run, daemon=True).start()
+
+    def _on_heartbeat_alive(self) -> None:
+        self._heartbeat_inflight = False
+        self._heartbeat_misses = 0
+
+    def _on_heartbeat_miss(self) -> None:
+        self._heartbeat_inflight = False
+        if not self._proxy_running:
+            return
+        # Require two consecutive misses so a busy proxy isn't falsely dropped
+        self._heartbeat_misses += 1
+        if self._heartbeat_misses >= 2:
+            self._log("Proxy stopped responding — marking as disconnected.")
+            self._handle_proxy_lost()
+
+    def _handle_proxy_lost(self) -> None:
+        self._stop_heartbeat()
+        self._proxy_running = False
+        self._litellm_pid = None
+        self._set_status("●  Disconnected", "bad")
+        self.launch_btn.setEnabled(True)
+        self.kill_btn.setEnabled(False)
+        self.open_terminal_btn.setEnabled(False)
+        self.latency_btn.setEnabled(False)
+        self._sync_menu_actions()
 
     def _apply_stylesheet(self) -> None:
         self.setStyleSheet(_stylesheet())
@@ -891,7 +1267,7 @@ class LiteLLMGui(QMainWindow):
         self.refresh_btn.setEnabled(True)
         self._show_loading_state(False)
         self._log(f"ERROR: {err}")
-        self._log("Set OPENROUTER_API_KEY as a system env var and restart.")
+        self._log("Enter your OpenRouter API key in the field above.")
 
     def _on_models_loaded(self, models: list[dict]) -> None:
         self._models = models
@@ -900,20 +1276,26 @@ class LiteLLMGui(QMainWindow):
         self._show_loading_state(False)
         self._log(f"Loaded {len(self._models)} models from OpenRouter.")
 
-        # Populate all three widgets
+        # Populate all three widgets — set_models preserves each widget's
+        # current pick across the refresh.
         self.advisor_widget.set_models(self._models)
         self.agent_widget.set_models(self._models)
         self.subagent_widget.set_models(self._models)
 
-        # Set default selections
-        self.advisor_widget.set_selected(DEFAULT_MODELS.get("advisor", ""))
-        self.agent_widget.set_selected(DEFAULT_MODELS.get("agent", ""))
-        self.subagent_widget.set_selected(DEFAULT_MODELS.get("subagent", ""))
+        # Apply last session's picks (or defaults) only on the very first load;
+        # a manual "Reload Models" then keeps whatever the user has selected.
+        if not self._initial_selection_done:
+            target = self._session_models or DEFAULT_MODELS
+            self.advisor_widget.set_selected(target.get("advisor", ""))
+            self.agent_widget.set_selected(target.get("agent", ""))
+            self.subagent_widget.set_selected(target.get("subagent", ""))
+            self._initial_selection_done = True
         self._update_cost_display()
 
     def _on_model_changed(self, role_key: str, model_id: str) -> None:
         self._current_models[role_key] = model_id
         self._update_cost_display()
+        self._save_session()
 
     # ── Cost Calculator ──────────────────────────────────────────────────
 
@@ -1064,16 +1446,26 @@ class LiteLLMGui(QMainWindow):
 
     # ── Port ──────────────────────────────────────────────────────────
 
+    def _current_port(self) -> int | None:
+        text = self.port_input.text().strip()
+        if text.isdigit() and 1 <= int(text) <= 65535:
+            return int(text)
+        return None
+
     def _on_port_changed(self, text: str) -> None:
-        try:
-            self._port = int(text.strip())
-        except ValueError:
-            pass
+        port = self._current_port()
+        self.port_input.setProperty("invalid", port is None)
+        self.port_input.style().unpolish(self.port_input)
+        self.port_input.style().polish(self.port_input)
+        if port is not None:
+            self._port = port
+            self._save_session()
 
     # ── Project Dir ────────────────────────────────────────────────────
 
     def _on_project_dir_changed(self, text: str) -> None:
         self._project_dir = text.strip()
+        self._save_session()
 
     def _browse_project_dir(self) -> None:
         dir_path = QFileDialog.getExistingDirectory(self, "Select Project Directory")
@@ -1097,6 +1489,8 @@ class LiteLLMGui(QMainWindow):
         self.kill_btn.setEnabled(True)
         self.open_terminal_btn.setEnabled(True)
         self.latency_btn.setEnabled(True)
+        self._sync_menu_actions()
+        self._start_heartbeat()
         self._log(f"Detected existing proxy on port {self._port}.")
         self._log("  (Kill it or launch a new one on a different port.)")
 
@@ -1108,6 +1502,10 @@ class LiteLLMGui(QMainWindow):
     def _launch_proxy(self) -> None:
         if self._proxy_running:
             self._log("Proxy is already running. Kill it first.")
+            return
+
+        if self._current_port() is None:
+            self._log("ERROR: Port must be a whole number between 1 and 65535.")
             return
 
         if not find_litellm():
@@ -1141,6 +1539,7 @@ class LiteLLMGui(QMainWindow):
 
         self._log(f"Starting LiteLLM on port {self._port}...")
         self.launch_btn.setEnabled(False)
+        self._sync_menu_actions()
         self._set_status("●  Connecting...", "warn", flashing=True)
 
         # Use signal-based worker
@@ -1158,17 +1557,22 @@ class LiteLLMGui(QMainWindow):
         self.kill_btn.setEnabled(True)
         self.open_terminal_btn.setEnabled(True)
         self.latency_btn.setEnabled(True)
+        self._sync_menu_actions()
+        self._start_heartbeat()
         self._log(f"LiteLLM is running on port {self._port} (PID {self._litellm_pid}).")
         self._update_claude_md()
 
     def _on_proxy_failed(self, err_text: str) -> None:
         self._set_status("●  Disconnected", "bad")
         self.launch_btn.setEnabled(True)
+        self._sync_menu_actions()
         self._log(f"Proxy failed to start:\n{err_text}")
 
     def _kill_proxy(self) -> None:
         self._log(f"Killing proxy on port {self._port}...")
+        self._stop_heartbeat()  # stop the instant the user expresses intent
         self.kill_btn.setEnabled(False)
+        self._sync_menu_actions()
         self._set_status("●  Disconnecting...", "warn", flashing=True)
         self._killer = ProxyKiller(self._port)
         self._killer_thread = threading.Thread(target=self._killer.run, daemon=True)
@@ -1177,11 +1581,13 @@ class LiteLLMGui(QMainWindow):
 
     def _on_proxy_killed(self) -> None:
         self._proxy_running = False
+        self._stop_heartbeat()
         self._set_status("●  Disconnected", "bad")
         self.launch_btn.setEnabled(True)
         self.kill_btn.setEnabled(False)
         self.open_terminal_btn.setEnabled(False)
         self.latency_btn.setEnabled(False)
+        self._sync_menu_actions()
         for w in [self.advisor_widget, self.agent_widget, self.subagent_widget]:
             w.set_latency(None)
         self._log("Proxy stopped.")
