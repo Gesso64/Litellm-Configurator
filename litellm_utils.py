@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -15,6 +17,13 @@ CONFIG_DIR = Path.home() / ".claude"
 SCRIPTS_DIR = CONFIG_DIR / "scripts"
 YAML_PATH = CONFIG_DIR / "litellm-select.yaml"
 CLAUDE_MD_PATH = CONFIG_DIR / "CLAUDE.md"
+VISION_ROUTER_JSON = CONFIG_DIR / "vision-router.json"
+VISION_ROUTER_PY = CONFIG_DIR / "vision_router.py"
+
+# Alias used for the dedicated vision-capable fallback deployment.
+VISION_FALLBACK_ALIAS = "vision-fallback"
+# Used when "Auto" is selected but none of the configured roles support vision.
+DEFAULT_VISION_FALLBACK_MODEL = "google/gemini-2.5-flash-lite"
 
 ROLES = [
     ("advisor", "claude-opus-4-7", "Advisor"),
@@ -85,7 +94,52 @@ def find_litellm() -> str | None:
     return None
 
 
-def generate_yaml(models: dict, yaml_path: Path = YAML_PATH, vision_support: dict | None = None) -> None:
+def resolve_auto_vision_fallback(models: dict, vision_support: dict | None) -> str:
+    """Pick a vision-capable model for the 'Auto' fallback choice.
+
+    Prefers reusing whichever configured role already supports images (advisor →
+    agent → subagent); if none do, falls back to a cheap built-in vision model.
+    Returns a bare OpenRouter model id (no ``~`` prefix).
+    """
+    vision_support = vision_support or {}
+    for role_key, _, _ in ROLES:
+        if vision_support.get(role_key):
+            mid = models.get(role_key, "").removeprefix("~")
+            if mid:
+                return mid
+    return DEFAULT_VISION_FALLBACK_MODEL
+
+
+def write_vision_router_config(
+    vision_support: dict | None,
+    fallback_alias: str | None,
+    path: Path = VISION_ROUTER_JSON,
+) -> None:
+    """Write the sidecar the vision_router hook reads. ``fallback_alias`` is None
+    when the feature is off (images then pass through and may error)."""
+    vision_map = {}
+    for role_key, alias, _ in ROLES:
+        vision_map[alias] = bool((vision_support or {}).get(role_key, False))
+    data = {
+        "enabled": bool(fallback_alias),
+        "vision_map": vision_map,
+        "fallback_alias": fallback_alias,
+    }
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def generate_yaml(
+    models: dict,
+    yaml_path: Path = YAML_PATH,
+    vision_support: dict | None = None,
+    vision_fallback: str | None = None,
+) -> None:
+    """Generate the LiteLLM config.
+
+    ``vision_fallback`` is a bare OpenRouter model id (already resolved from the
+    GUI's Auto/Off/Choose control) to route image requests to when the target
+    model lacks vision; ``None`` disables the feature.
+    """
     import yaml
     model_list = []
     for role_key, alias, _ in ROLES:
@@ -101,10 +155,26 @@ def generate_yaml(models: dict, yaml_path: Path = YAML_PATH, vision_support: dic
         if vision_support is not None:
             entry["model_info"] = {"supports_vision": vision_support.get(role_key, False)}
         model_list.append(entry)
+
+    litellm_settings: dict = {"drop_params": True}
+    fallback_alias: str | None = None
+    if vision_fallback:
+        fb_id = vision_fallback.removeprefix("~")
+        model_list.append({
+            "model_name": VISION_FALLBACK_ALIAS,
+            "litellm_params": {
+                "model": f"openrouter/{fb_id}",
+                "api_key": "os.environ/OPENROUTER_API_KEY",
+            },
+            "model_info": {"supports_vision": True},
+        })
+        litellm_settings["callbacks"] = ["vision_router.instance"]
+        fallback_alias = VISION_FALLBACK_ALIAS
+
     config = {
         "model_list": model_list,
         "general_settings": {"master_key": "sk-local-fake"},
-        "litellm_settings": {"drop_params": True},
+        "litellm_settings": litellm_settings,
         "router_settings": {
             "allowed_fails": 1000,
             "cooldown_time": 0,
@@ -112,6 +182,24 @@ def generate_yaml(models: dict, yaml_path: Path = YAML_PATH, vision_support: dic
     }
     with open(yaml_path, "w") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+
+    # Write the sidecar next to the YAML so the deployed hook finds it.
+    write_vision_router_config(
+        vision_support, fallback_alias, path=yaml_path.parent / VISION_ROUTER_JSON.name
+    )
+
+
+def deploy_vision_router(dest_dir: Path = CONFIG_DIR) -> bool:
+    """Copy vision_router.py next to the config so the proxy can import it.
+    Returns True on success."""
+    src = Path(__file__).resolve().parent / "vision_router.py"
+    try:
+        if src.exists():
+            shutil.copyfile(src, dest_dir / "vision_router.py")
+            return True
+    except Exception:
+        pass
+    return False
 
 
 _ROUTING_START = "<!-- litellm-routing-start -->"

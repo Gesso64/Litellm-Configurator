@@ -15,8 +15,8 @@ from pathlib import Path
 
 from litellm_utils import (
     CONFIG_DIR, ROLES, YAML_PATH,
-    find_litellm, generate_yaml, health_check, kill_process_on_port,
-    update_claude_md,
+    deploy_vision_router, find_litellm, generate_yaml, health_check,
+    kill_process_on_port, resolve_auto_vision_fallback, update_claude_md,
 )
 
 SCRIPTS_DIR = Path.home() / ".claude" / "scripts"
@@ -152,6 +152,7 @@ try:
         QPushButton,
         QFrame,
         QPlainTextEdit,
+        QScrollArea,
         QSizePolicy,
         QSplitter,
         QVBoxLayout,
@@ -187,6 +188,13 @@ def _stylesheet() -> str:
         QLineEdit[invalid="true"] {{ border: 1px solid {b['bad']}; }}
         QLineEdit[invalid="true"]:focus {{ border: 1px solid {b['bad']}; }}
 
+        QComboBox {{ background-color: {b['panel_2']}; color: {b['text']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 6px 10px; font-size: 13px; }}
+        QComboBox:hover {{ border: 1px solid {b['accent']}; }}
+        QComboBox:focus {{ border: 1px solid {b['accent']}; }}
+        QComboBox::drop-down {{ border: none; width: 20px; }}
+        QComboBox::down-arrow {{ image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid {b['muted']}; margin-right: 8px; }}
+        QComboBox QAbstractItemView {{ background-color: {b['panel_2']}; color: {b['text']}; border: 1px solid {b['line']}; border-radius: 6px; selection-background-color: {b['panel_3']}; selection-color: {b['accent']}; outline: none; }}
+
         QPushButton {{ background-color: {b['panel_3']}; color: {b['text']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 8px 20px; font-size: 13px; font-weight: 500; }}
         QPushButton:hover {{ background-color: {b['line']}; border-color: {b['accent']}; }}
         QPushButton:pressed {{ background-color: {b['accent']}; color: {b['bg']}; }}
@@ -204,6 +212,8 @@ def _stylesheet() -> str:
         QListWidget::item:hover {{ background-color: {b['line']}; }}
         QListWidget::item:disabled {{ color: {b['muted']}; font-style: italic; font-size: 12px; }}
 
+        QScrollArea {{ background-color: {b['bg']}; border: none; }}
+        QScrollArea > QWidget > QWidget {{ background-color: {b['bg']}; }}
         QPlainTextEdit {{ background-color: {b['panel']}; color: {b['muted']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 8px; font-family: 'Consolas', monospace; font-size: 12px; }}
         QFrame#card {{ background-color: {b['panel']}; border: 1px solid {b['line']}; border-radius: 8px; padding: 12px; }}
         QFrame#card-accent {{ background-color: {b['panel']}; border: 1px solid {b['accent']}; border-radius: 8px; padding: 12px; }}
@@ -310,7 +320,8 @@ def list_profiles() -> list[tuple[str, dict]]:
     return result
 
 
-def save_profile(name: str, port: int, models: dict, project_dir: str = "") -> None:
+def save_profile(name: str, port: int, models: dict, project_dir: str = "",
+                 vision_fallback: str = "auto") -> None:
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     path = profile_path(name)
     data = {
@@ -318,6 +329,7 @@ def save_profile(name: str, port: int, models: dict, project_dir: str = "") -> N
         "port": port,
         "project_dir": project_dir,
         "models": models,
+        "vision_fallback": vision_fallback,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -392,12 +404,37 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
             f'claude'
         )
         if platform.system() == "Darwin":
-            escaped = bash_script.replace('"', '\\"')
-            subprocess.Popen(
-                ["osascript", "-e",
-                 f'tell application "Terminal" to do script "{escaped}"'],
-                shell=False,
+            # Write the script to a temp .command file so AppleScript only has to
+            # pass a single path string — sidesteps all escaping of box-drawing
+            # characters, quotes, and unicode in the banner.
+            script_path = Path(tempfile.gettempdir()) / "litellm-launch-claude.command"
+            script_path.write_text("#!/bin/bash\n" + bash_script + "\n", encoding="utf-8")
+            try:
+                script_path.chmod(0o755)
+            except Exception:
+                pass
+
+            # Prefer iTerm2 if it's installed; otherwise fall back to Terminal.app.
+            iterm_installed = (
+                Path("/Applications/iTerm.app").exists()
+                or Path.home().joinpath("Applications/iTerm.app").exists()
             )
+            if iterm_installed:
+                applescript = (
+                    'tell application "iTerm" to activate\n'
+                    'tell application "iTerm"\n'
+                    '  set newWindow to (create window with default profile)\n'
+                    f'  tell current session of newWindow to write text "{script_path}"\n'
+                    'end tell\n'
+                )
+            else:
+                applescript = (
+                    'tell application "Terminal"\n'
+                    '  activate\n'
+                    f'  do script "{script_path}"\n'
+                    'end tell\n'
+                )
+            subprocess.Popen(["osascript", "-e", applescript], shell=False)
         else:
             for term_cmd in [
                 ["x-terminal-emulator", "-e", "bash", "-c", bash_script],
@@ -423,6 +460,15 @@ class ModelSearchWidget(QFrame):
     def __init__(self, role_label: str, claude_alias: str, models: list[dict], parent=None):
         super().__init__(parent)
         self.setObjectName("card")
+        # Reserve enough height for EVERY child at once — header, search, list
+        # (80 min), selected-model line, a two-line wrapped vision warning, and
+        # the latency line — plus spacing/margins. The vision warning is hidden
+        # by default so Qt's auto-computed minimum under-reserves and the card
+        # gets compressed into overlap when the warning appears. With this floor
+        # the card can never be smaller than its fully-populated layout, and the
+        # surrounding QScrollArea scrolls the panel when the window itself is too
+        # short — so the "selected model overlaps the list" bug cannot recur.
+        self.setMinimumHeight(300)
         self._all_models = models
         self._role_label = role_label
         self._claude_alias = claude_alias
@@ -443,12 +489,24 @@ class ModelSearchWidget(QFrame):
         header.addStretch()
         layout.addLayout(header)
 
-        # Search bar
+        # Search bar + sort filter
+        search_row = QHBoxLayout()
+        search_row.setSpacing(6)
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search models by name or ID…")
         self.search_input.textChanged.connect(self._filter_models)
         self.search_input.returnPressed.connect(self._select_first_result)
-        layout.addWidget(self.search_input)
+        search_row.addWidget(self.search_input, stretch=1)
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Default", "default")
+        self.sort_combo.addItem("Image first", "img")
+        self.sort_combo.addItem("Price ↑", "price_asc")
+        self.sort_combo.addItem("Price ↓", "price_desc")
+        self.sort_combo.setToolTip("Sort the model list")
+        self.sort_combo.currentIndexChanged.connect(self._refresh_list)
+        search_row.addWidget(self.sort_combo)
+        layout.addLayout(search_row)
 
         # Model list
         self.model_list = QListWidget()
@@ -463,10 +521,15 @@ class ModelSearchWidget(QFrame):
         self.selected_display.setObjectName("model-display")
         layout.addWidget(self.selected_display)
 
-        self.vision_warn = QLabel("  No image support — Claude Code may send screenshots to this role")
+        self.vision_warn = QLabel("")
         self.vision_warn.setObjectName("bad")
+        self.vision_warn.setWordWrap(True)
         self.vision_warn.setVisible(False)
         layout.addWidget(self.vision_warn)
+
+        # Global vision-fallback context, set by the main window.
+        self._fallback_active = False
+        self._fallback_target = ""
 
         self.latency_label = QLabel("Latency: —")
         self.latency_label.setObjectName("status")
@@ -491,6 +554,8 @@ class ModelSearchWidget(QFrame):
             ]
         else:
             filtered = list(self._all_models)
+
+        filtered = self._sort_models(filtered)
 
         for m in filtered:
             mid = m.get("id", "?")
@@ -518,6 +583,23 @@ class ModelSearchWidget(QFrame):
 
         self.model_list.blockSignals(False)
 
+    def _sort_models(self, models: list[dict]) -> list[dict]:
+        """Apply the current sort-dropdown selection. 'Default' keeps the
+        incoming order (OpenRouter's id-sorted list)."""
+        mode = self.sort_combo.currentData() if hasattr(self, "sort_combo") else "default"
+
+        def price_in(m: dict) -> float:
+            return float(m.get("pricing", {}).get("prompt", 0) or 0)
+
+        if mode == "img":
+            # Vision-capable models first, then id order within each group.
+            return sorted(models, key=lambda m: (not _model_supports_vision(m), m.get("id", "")))
+        if mode == "price_asc":
+            return sorted(models, key=lambda m: (price_in(m), m.get("id", "")))
+        if mode == "price_desc":
+            return sorted(models, key=lambda m: (-price_in(m), m.get("id", "")))
+        return models
+
     def _filter_models(self) -> None:
         self._refresh_list()
 
@@ -535,19 +617,43 @@ class ModelSearchWidget(QFrame):
         mid = current.data(Qt.UserRole)
         self._selected_id = mid
         self.selected_display.setText(mid)
-        m = find_model_by_id(self._all_models, mid)
-        self.vision_warn.setVisible(m is not None and not _model_supports_vision(m))
+        self._update_vision_warn()
         self.model_selected.emit(mid)
 
     def set_selected(self, model_id: str) -> None:
         self._selected_id = model_id
         self.selected_display.setText(model_id or "No model selected")
-        m = find_model_by_id(self._all_models, model_id)
-        self.vision_warn.setVisible(m is not None and not _model_supports_vision(m))
+        self._update_vision_warn()
         for i in range(self.model_list.count()):
             if self.model_list.item(i).data(Qt.UserRole) == model_id:
                 self.model_list.setCurrentRow(i)
                 break
+
+    def set_vision_fallback(self, active: bool, target: str) -> None:
+        """Tell the card whether image requests will auto-route, and to where."""
+        self._fallback_active = active
+        self._fallback_target = target or ""
+        self._update_vision_warn()
+
+    def _update_vision_warn(self) -> None:
+        """Show nothing for vision models; an info line when images auto-route;
+        a red warning when a non-vision model is selected with no fallback."""
+        if not self._selected_id:
+            self.vision_warn.setVisible(False)
+            return
+        m = find_model_by_id(self._all_models, self._selected_id)
+        if m is None or _model_supports_vision(m):
+            self.vision_warn.setVisible(False)
+            return
+        if self._fallback_active and self._fallback_target:
+            self.vision_warn.setText(f"  No image support — images auto-route to {self._fallback_target}")
+            self.vision_warn.setObjectName("accent")
+        else:
+            self.vision_warn.setText("  No image support — Claude Code screenshots to this role will error")
+            self.vision_warn.setObjectName("bad")
+        self.vision_warn.style().unpolish(self.vision_warn)
+        self.vision_warn.style().polish(self.vision_warn)
+        self.vision_warn.setVisible(True)
 
     def selected_model(self) -> str | None:
         return self._selected_id
@@ -753,11 +859,14 @@ class ProxyLauncher(QObject):
         pid_path = Path(tempfile.gettempdir()) / "litellm-gui.pid"
         try:
             litellm_cmd = find_litellm() or "litellm"
+            # Make the deployed vision_router hook importable by the proxy.
+            pythonpath = str(CONFIG_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
             with open(log_path, "w") as log_fh:
                 proc = subprocess.Popen(
                     [litellm_cmd, "--config", str(YAML_PATH), "--port", str(self._port)],
                     env={**os.environ, "PYTHONIOENCODING": "utf-8",
-                         "PYTHONUTF8": "1", "SSLKEYLOGFILE": ""},
+                         "PYTHONUTF8": "1", "SSLKEYLOGFILE": "",
+                         "PYTHONPATH": pythonpath},
                     stdout=log_fh,
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
@@ -842,6 +951,8 @@ class LiteLLMGui(QMainWindow):
         self._port = session.get("port", 4001)
         self._project_dir = session.get("project_dir", "")
         self._session_models = session.get("models") or None
+        # Vision fallback: "auto", "off", or a concrete OpenRouter model id.
+        self._vision_fallback = session.get("vision_fallback", "auto")
         self._initial_selection_done = False
         self._current_models: dict[str, str] = dict(self._session_models or DEFAULT_MODELS)
 
@@ -979,6 +1090,20 @@ class LiteLLMGui(QMainWindow):
 
         right_layout.addLayout(cards_layout, stretch=1)
 
+        # ── Vision fallback row ──
+        vision_row = QHBoxLayout()
+        vision_lbl = QLabel("Vision fallback:")
+        vision_lbl.setObjectName("status")
+        vision_row.addWidget(vision_lbl)
+        self.vision_combo = QComboBox()
+        self.vision_combo.setMinimumWidth(260)
+        self.vision_combo.currentIndexChanged.connect(self._on_vision_fallback_changed)
+        vision_row.addWidget(self.vision_combo)
+        self.vision_hint = QLabel("")
+        self.vision_hint.setObjectName("status")
+        vision_row.addWidget(self.vision_hint, stretch=1)
+        right_layout.addLayout(vision_row)
+
         # ── Cost Summary Bar ──
         cost_frame = QFrame()
         cost_frame.setObjectName("card")
@@ -1036,7 +1161,16 @@ class LiteLLMGui(QMainWindow):
         action_row.addStretch()
         right_layout.addLayout(action_row)
 
-        root.addWidget(right, stretch=1)
+        # Wrap the right panel in a scroll area so that when the content is taller
+        # than the window, it scrolls instead of compressing widgets into overlap.
+        # This makes the recurring "model name overlaps the list" bug structurally
+        # impossible — every widget always gets its natural height.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(right)
+        root.addWidget(scroll, stretch=1)
 
     def _build_menu_bar(self) -> None:
         bar = self.menuBar()
@@ -1161,8 +1295,70 @@ class LiteLLMGui(QMainWindow):
             },
             "port": self._port,
             "project_dir": self._project_dir,
+            "vision_fallback": self._vision_fallback,
         }
         save_settings(settings)
+
+    # ── Vision fallback ────────────────────────────────────────────────
+
+    def _populate_vision_combo(self) -> None:
+        """Fill the combo with Auto / Off / each vision-capable model."""
+        self.vision_combo.blockSignals(True)
+        self.vision_combo.clear()
+        self.vision_combo.addItem("Auto (use a vision-capable model)", "auto")
+        self.vision_combo.addItem("Off (let image requests error)", "off")
+        for m in self._models:
+            if _model_supports_vision(m):
+                mid = m.get("id", "")
+                if mid:
+                    self.vision_combo.addItem(mid, mid)
+
+        # Restore the persisted choice; fall back to Auto if the saved model id
+        # is no longer in the list.
+        idx = self.vision_combo.findData(self._vision_fallback)
+        self.vision_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        if idx < 0:
+            self._vision_fallback = "auto"
+        self.vision_combo.blockSignals(False)
+        self._update_vision_fallback_ui()
+
+    def _on_vision_fallback_changed(self, _index: int) -> None:
+        data = self.vision_combo.currentData()
+        if data is not None:
+            self._vision_fallback = data
+            self._save_session()
+            self._update_vision_fallback_ui()
+
+    def _resolved_vision_fallback(self) -> str | None:
+        """Resolve the current choice to a concrete model id, or None when Off."""
+        if self._vision_fallback == "off":
+            return None
+        models = {
+            "advisor": self.advisor_widget.selected_model() or "",
+            "agent": self.agent_widget.selected_model() or "",
+            "subagent": self.subagent_widget.selected_model() or "",
+        }
+        if self._vision_fallback == "auto":
+            vision_support = {
+                "advisor": self.advisor_widget.supports_vision(),
+                "agent": self.agent_widget.supports_vision(),
+                "subagent": self.subagent_widget.supports_vision(),
+            }
+            return resolve_auto_vision_fallback(models, vision_support)
+        return self._vision_fallback  # a concrete model id
+
+    def _update_vision_fallback_ui(self) -> None:
+        """Refresh the hint and push fallback state onto each role card."""
+        target = self._resolved_vision_fallback()
+        active = target is not None
+        if not active:
+            self.vision_hint.setText("image requests to non-vision models will error")
+        elif self._vision_fallback == "auto":
+            self.vision_hint.setText(f"→ {target}")
+        else:
+            self.vision_hint.setText("")
+        for w in (self.advisor_widget, self.agent_widget, self.subagent_widget):
+            w.set_vision_fallback(active, target or "")
 
     def closeEvent(self, event) -> None:
         self._save_session()
@@ -1290,11 +1486,13 @@ class LiteLLMGui(QMainWindow):
             self.agent_widget.set_selected(target.get("agent", ""))
             self.subagent_widget.set_selected(target.get("subagent", ""))
             self._initial_selection_done = True
+        self._populate_vision_combo()
         self._update_cost_display()
 
     def _on_model_changed(self, role_key: str, model_id: str) -> None:
         self._current_models[role_key] = model_id
         self._update_cost_display()
+        self._update_vision_fallback_ui()
         self._save_session()
 
     # ── Cost Calculator ──────────────────────────────────────────────────
@@ -1401,6 +1599,11 @@ class LiteLLMGui(QMainWindow):
         self.agent_widget.set_selected(models.get("agent", ""))
         self.subagent_widget.set_selected(models.get("subagent", ""))
 
+        # Vision fallback (older profiles default to Auto)
+        self._vision_fallback = data.get("vision_fallback", "auto")
+        if self._models:
+            self._populate_vision_combo()
+
         self._log(f"Loaded profile '{data.get('name', '?')}'")
         self._update_cost_display()
         if self._proxy_running:
@@ -1417,7 +1620,8 @@ class LiteLLMGui(QMainWindow):
                 "agent": self.agent_widget.selected_model() or "",
                 "subagent": self.subagent_widget.selected_model() or "",
             }
-            save_profile(name.strip(), self._port, models, self._project_dir)
+            save_profile(name.strip(), self._port, models, self._project_dir,
+                         self._vision_fallback)
             self._populate_profiles()
             self._log(f"Saved profile '{name.strip()}'")
 
@@ -1528,9 +1732,16 @@ class LiteLLMGui(QMainWindow):
             "agent": self.agent_widget.supports_vision(),
             "subagent": self.subagent_widget.supports_vision(),
         }
+        vision_fallback = self._resolved_vision_fallback()
         self._log("Generating LiteLLM config...")
-        generate_yaml(models, vision_support=vision_support)
+        if vision_fallback:
+            if not deploy_vision_router():
+                self._log("  [warn] could not deploy vision_router.py — image rerouting disabled.")
+                vision_fallback = None
+        generate_yaml(models, vision_support=vision_support, vision_fallback=vision_fallback)
         self._log(f"  Wrote {YAML_PATH}")
+        if vision_fallback:
+            self._log(f"  Image requests to non-vision roles will route to {vision_fallback}.")
 
         # Check if port is taken
         if health_check(self._port, timeout=1):
