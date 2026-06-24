@@ -1,0 +1,31 @@
+# Phase 0 spike: shared proxy with two namespaced aliases pointing at the
+# SAME cheap backend. We're not testing model behavior — we're testing
+# whether each terminal's request arrives with its own model name.
+# The verdict is read from the proxy log: does it show 'agentA-main' in
+# one terminal's requests and 'agentB-main' in the other?
+model_list:
+  - model_name: agentA-main
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+  - model_name: agentB-main
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+  # Catch-all so Claude Code's other internal aliases (haiku, etc.) don't 404
+  # during startup before the first user prompt lands.
+  - model_name: "*"
+    litellm_params:
+      model: openrouter/deepseek/deepseek-v4-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+
+general_settings:
+  master_key: sk-local-fake
+
+litellm_settings:
+  drop_params: true
+  set_verbose: true
+
+router_settings:
+  allowed_fails: 1000
+  cooldown_time: 0

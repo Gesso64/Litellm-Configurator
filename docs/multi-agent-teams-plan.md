@@ -1,6 +1,7 @@
 # Plan: Multi-Agent Teams (parallel, profile-isolated Claude Code agents)
 
-> Status: **planned, not started.** This is a design document, not implemented code.
+> **Status:** strategy document. Phase 0 spike confirmed; Phase 1+ planned, not started.
+> For the buildable, file-level MVP plan see [multi-agent-teams-mvp.md](multi-agent-teams-mvp.md).
 
 ## Goal
 
@@ -59,12 +60,23 @@ GB and a slow launch. Instead:
 per-instance model env vars. If it does → shared proxy. If not → fall back to
 per-agent proxies with a practical cap (~2–4).
 
+> Validated. See the Phase 0 section below — Claude Code does honor these
+> env vars, so the shared-proxy path is the one we're building.
+
 ## Phases
 
-### Phase 0 — Spike (gates the architecture)
-Confirm a single proxy + two terminals with different `ANTHROPIC_MODEL` /
-`ANTHROPIC_SMALL_FAST_MODEL` route to different models. Decides shared-proxy vs
-per-agent-proxy before any UI is built.
+### Phase 0 — Spike (gates the architecture) — **CONFIRMED VIABLE**
+
+Tested with the `spike/` harness: two `claude -p --bare` invocations hitting one
+LiteLLM proxy on `:4099`, each with a distinct `ANTHROPIC_MODEL` env var
+(`agentA-main` / `agentB-main`). The proxy log captured the exact alias name in
+each outgoing request body — Claude Code honors per-instance `ANTHROPIC_MODEL`.
+
+**Verdict:** shared-proxy architecture is unblocked. Build Teams on top of one
+LiteLLM proxy with namespaced aliases. The "per-agent proxy with a cap" branch
+is no longer needed.
+
+The harness lives in `spike/` for future regression checks.
 
 ### Phase 1 — Team model & scalable GUI
 A Team = N agents, each `{name, models, alias-namespace, branch}`. Persist under
