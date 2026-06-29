@@ -19,6 +19,7 @@ YAML_PATH = CONFIG_DIR / "litellm-select.yaml"
 CLAUDE_MD_PATH = CONFIG_DIR / "CLAUDE.md"
 VISION_ROUTER_JSON = CONFIG_DIR / "vision-router.json"
 VISION_ROUTER_PY = CONFIG_DIR / "vision_router.py"
+SPEND_DB_PATH = CONFIG_DIR / "litellm-spend.db"
 
 # Alias used for the dedicated vision-capable fallback deployment.
 VISION_FALLBACK_ALIAS = "vision-fallback"
@@ -30,6 +31,14 @@ ROLES = [
     ("agent", "claude-sonnet-4-6", "Agent"),
     ("subagent", "claude-*", "Subagent"),
 ]
+
+# Additional aliases that should share a role's mapping. The default Claude Code
+# model id changes over time (e.g. claude-opus-4-8 replaced 4-7); we publish
+# the role's underlying upstream model under all of these aliases so requests
+# are routed correctly regardless of which default the client picks.
+ROLE_EXTRA_ALIASES: dict[str, list[str]] = {
+    "advisor": ["claude-opus-4-8"],
+}
 
 
 def health_check(port: int, timeout: int = 10) -> bool:
@@ -99,12 +108,12 @@ def resolve_auto_vision_fallback(models: dict, vision_support: dict | None) -> s
 
     Prefers reusing whichever configured role already supports images (advisor →
     agent → subagent); if none do, falls back to a cheap built-in vision model.
-    Returns a bare OpenRouter model id (no ``~`` prefix).
+    Returns a bare OpenRouter model id (preserving the ``~`` prefix for latest-track aliases).
     """
     vision_support = vision_support or {}
     for role_key, _, _ in ROLES:
         if vision_support.get(role_key):
-            mid = models.get(role_key, "").removeprefix("~")
+            mid = models.get(role_key, "")
             if mid:
                 return mid
     return DEFAULT_VISION_FALLBACK_MODEL
@@ -144,22 +153,26 @@ def generate_yaml(
     model_list = []
     for role_key, alias, _ in ROLES:
         full_id = models.get(role_key, "")
-        model_id = full_id.removeprefix("~")
-        entry: dict = {
-            "model_name": alias,
-            "litellm_params": {
-                "model": f"openrouter/{model_id}",
-                "api_key": "os.environ/OPENROUTER_API_KEY",
-            },
-        }
-        if vision_support is not None:
-            entry["model_info"] = {"supports_vision": vision_support.get(role_key, False)}
-        model_list.append(entry)
+        model_id = full_id
+        aliases = [alias] + ROLE_EXTRA_ALIASES.get(role_key, [])
+        for a in aliases:
+            entry: dict = {
+                "model_name": a,
+                "litellm_params": {
+                    "model": f"openrouter/{model_id}",
+                    "api_key": "os.environ/OPENROUTER_API_KEY",
+                    "metadata": {"lc_alias": a},
+                },
+            }
+            if vision_support is not None:
+                entry["model_info"] = {"supports_vision": vision_support.get(role_key, False)}
+            model_list.append(entry)
 
     litellm_settings: dict = {"drop_params": True}
+    callbacks: list[str] = ["litellm_session_logger.instance"]
     fallback_alias: str | None = None
     if vision_fallback:
-        fb_id = vision_fallback.removeprefix("~")
+        fb_id = vision_fallback
         model_list.append({
             "model_name": VISION_FALLBACK_ALIAS,
             "litellm_params": {
@@ -168,12 +181,15 @@ def generate_yaml(
             },
             "model_info": {"supports_vision": True},
         })
-        litellm_settings["callbacks"] = ["vision_router.instance"]
+        callbacks.append("vision_router.instance")
         fallback_alias = VISION_FALLBACK_ALIAS
+    litellm_settings["callbacks"] = callbacks
 
     config = {
         "model_list": model_list,
-        "general_settings": {"master_key": "sk-local-fake"},
+        "general_settings": {
+            "master_key": "sk-local-fake",
+        },
         "litellm_settings": litellm_settings,
         "router_settings": {
             "allowed_fails": 1000,
@@ -202,29 +218,49 @@ def deploy_vision_router(dest_dir: Path = CONFIG_DIR) -> bool:
     return False
 
 
+def deploy_session_logger(dest_dir: Path = CONFIG_DIR) -> bool:
+    """Copy litellm_session_logger.py next to the config so the proxy can import it."""
+    src = Path(__file__).resolve().parent / "litellm_session_logger.py"
+    try:
+        if src.exists():
+            shutil.copyfile(src, dest_dir / "litellm_session_logger.py")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+# Markers must match claude_md_renderer.py exactly — they're a contract.
 _ROUTING_START = "<!-- litellm-routing-start -->"
 _ROUTING_END = "<!-- litellm-routing-end -->"
 
 
-def _build_routing_block(models: dict) -> str:
-    advisor = models.get("advisor", "—").removeprefix("~")
-    agent = models.get("agent", "—").removeprefix("~")
-    subagent = models.get("subagent", "—").removeprefix("~")
-    return "\n".join([
-        _ROUTING_START,
-        "| Alias | Maps to | Role |",
-        "|-------|---------|------|",
-        f"| claude-opus-4-7 | {advisor} | Advisor |",
-        f"| claude-sonnet-4-6 | {agent} | Agent |",
-        f"| claude-* | {subagent} | Subagent |",
-        _ROUTING_END,
-    ])
+def _build_routing_block(
+    models: dict,
+    preset_name: str | None = None,
+    pricing_by_role: dict | None = None,
+    budget=None,
+) -> str:
+    """Delegate to the richer renderer in claude_md_renderer.py."""
+    from claude_md_renderer import render_routing_block
+    return render_routing_block(models, preset_name, pricing_by_role, budget)
 
 
-def update_claude_md(models: dict, port: int) -> bool | str:
-    """Directly rewrite the LiteLLM routing table in CLAUDE.md — no LLM needed."""
+def update_claude_md(
+    models: dict,
+    port: int,
+    preset_name: str | None = None,
+    pricing_by_role: dict | None = None,
+    budget=None,
+) -> bool | str:
+    """Directly rewrite the LiteLLM routing table in CLAUDE.md — no LLM needed.
+
+    Optional kwargs flow through to the renderer for the richer block:
+    preset_name, pricing_by_role={"advisor": "$X / $Y per 1M", ...},
+    budget=claude_md_renderer.BudgetView(...).
+    """
     try:
-        block = _build_routing_block(models)
+        block = _build_routing_block(models, preset_name, pricing_by_role, budget)
 
         if not CLAUDE_MD_PATH.exists():
             CLAUDE_MD_PATH.write_text(

@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 from litellm_utils import (
-    CONFIG_DIR, ROLES, YAML_PATH,
+    CONFIG_DIR, ROLES, ROLE_EXTRA_ALIASES, YAML_PATH,
     deploy_vision_router, find_litellm, generate_yaml, health_check,
     kill_process_on_port, resolve_auto_vision_fallback, update_claude_md,
 )
@@ -115,6 +115,17 @@ PRESETS: list[dict] = [
         "project_dir": "",
         "est_cost": "$1.66/1M in",
     },
+    {
+        "name": "★ Sonnet-High Parity",
+        "models": {
+            "advisor": "~anthropic/claude-sonnet-latest",
+            "agent": "z-ai/glm-5.2",
+            "subagent": "deepseek/deepseek-v4-flash",
+        },
+        "port": 4001,
+        "project_dir": "",
+        "est_cost": "$3.20/1M in",
+    },
 ]
 
 PALETTE = {
@@ -133,7 +144,16 @@ PALETTE = {
 }
 
 try:
-    from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
+    from PySide6.QtCore import (
+        QEasingCurve,
+        QObject,
+        QPropertyAnimation,
+        QSequentialAnimationGroup,
+        Qt,
+        QTimer,
+        Signal,
+        Slot,
+    )
     from PySide6.QtGui import QAction, QFont, QFontDatabase, QIcon, QKeySequence
     from PySide6.QtWidgets import (
         QApplication,
@@ -141,6 +161,7 @@ try:
         QDialog,
         QDialogButtonBox,
         QFileDialog,
+        QGraphicsOpacityEffect,
         QHBoxLayout,
         QInputDialog,
         QLabel,
@@ -182,6 +203,7 @@ def _stylesheet() -> str:
         QLabel#warn {{ color: {b['warn']}; background: transparent; }}
         QLabel#accent {{ color: {b['accent']}; background: transparent; }}
         QLabel#cost-label {{ font-size: 13px; color: {b['accent_2']}; padding: 4px 0; background: transparent; }}
+        QLabel#session-spend {{ font-size: 13px; color: {b['accent']}; padding: 4px 0; background: transparent; }}
 
         QLineEdit {{ background-color: {b['panel_2']}; color: {b['text']}; border: 1px solid {b['line']}; border-radius: 6px; padding: 6px 10px; font-size: 13px; }}
         QLineEdit:focus {{ border: 1px solid {b['accent']}; }}
@@ -273,6 +295,26 @@ def _stylesheet() -> str:
         QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
             background: none;
         }}
+
+        QPushButton#sidebar-toggle {{
+            background: transparent;
+            border: none;
+            border-radius: 5px;
+            color: {b['muted']};
+            padding: 0;
+            font-size: 18px;
+            min-width: 26px;
+            max-width: 26px;
+            min-height: 26px;
+            max-height: 26px;
+        }}
+        QPushButton#sidebar-toggle:hover {{
+            background: {b['panel_3']};
+            color: {b['text']};
+        }}
+        QPushButton#sidebar-toggle:pressed {{
+            color: {b['accent']};
+        }}
     """
 
 
@@ -354,7 +396,11 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
     for role_key, alias, label in ROLES:
         mid = models.get(role_key, "?")
         mid_display = (mid[:35] + "..") if len(mid) > 37 else mid
-        role_lines.append(f"║  {label:10s}  {alias:<18s} →  {mid_display:<37s} ║")
+        extras = ROLE_EXTRA_ALIASES.get(role_key, [])
+        alias_display = ", ".join([alias] + extras)
+        if len(alias_display) > 35:
+            alias_display = alias_display[:33] + ".."
+        role_lines.append(f"║  {label:10s}  {alias_display:<35s} →  {mid_display:<20s} ║")
     role_block_ps = "".join(f'Write-Host "{line}"; ' for line in role_lines)
     role_block_bash = "".join(f'echo "{line}"; ' for line in role_lines)
 
@@ -509,7 +555,7 @@ class ModelSearchWidget(QFrame):
         layout.addLayout(search_row)
 
         # Model list
-        self.model_list = QListWidget()
+        self.model_list = SmoothListWidget()
         self.model_list.setMinimumHeight(80)
         self.model_list.setAlternatingRowColors(True)
         self.model_list.setSpacing(0)
@@ -861,7 +907,7 @@ class ProxyLauncher(QObject):
             litellm_cmd = find_litellm() or "litellm"
             # Make the deployed vision_router hook importable by the proxy.
             pythonpath = str(CONFIG_DIR) + os.pathsep + os.environ.get("PYTHONPATH", "")
-            with open(log_path, "w") as log_fh:
+            with open(log_path, "w", encoding="utf-8") as log_fh:
                 proc = subprocess.Popen(
                     [litellm_cmd, "--config", str(YAML_PATH), "--port", str(self._port)],
                     env={**os.environ, "PYTHONIOENCODING": "utf-8",
@@ -876,11 +922,86 @@ class ProxyLauncher(QObject):
             if health_check(self._port):
                 self.ready.emit(proc.pid)
             else:
-                last = log_path.read_text().splitlines()[-5:] if log_path.exists() else []
+                if log_path.exists():
+                    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+                    last = log_text.splitlines()[-10:]
+                else:
+                    last = []
                 err_text = "\n".join(last) if last else "(no log output)"
                 self.failed.emit(err_text)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class SpendPoller(QObject):
+    """Worker that fetches the cumulative OpenRouter usage for the current key."""
+    result = Signal(float)  # total lifetime usage in USD
+    error = Signal(str)
+
+    @Slot()
+    def run(self) -> None:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            self.error.emit("No API key")
+            return
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/auth/key",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            usage = data.get("data", {}).get("usage")
+            if usage is None:
+                self.error.emit("usage field missing from response")
+            else:
+                self.result.emit(float(usage))
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class ModelSpendPoller(QObject):
+    """Worker that fetches per-model spend logs from the LiteLLM proxy DB.
+
+    Returns a dict mapping the LiteLLM model_name alias to cumulative spend (USD).
+    """
+    result = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, port: int, parent=None):
+        super().__init__(parent)
+        self._port = port
+
+    @Slot()
+    def run(self) -> None:
+        # Read our local session log (LiteLLM's /spend/logs needs a prisma DB
+        # which we disabled to avoid the prisma import crash). The log is
+        # populated by litellm_session_logger.py — one JSONL line per request.
+        log_path = Path.home() / ".claude" / "litellm-session-log.jsonl"
+        totals: dict[str, float] = {}
+        if not log_path.exists():
+            self.result.emit(totals)
+            return
+        try:
+            for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+                if entry.get("status") != "ok":
+                    continue
+                alias = entry.get("alias_requested") or "(unknown)"
+                total = entry.get("total_tokens")
+                if not isinstance(total, (int, float)):
+                    total = (entry.get("prompt_tokens") or 0) + (entry.get("completion_tokens") or 0)
+                totals[alias] = totals.get(alias, 0.0) + float(total)
+        except Exception as exc:
+            self.error.emit(str(exc))
+            return
+        self.result.emit(totals)
 
 
 class LatencyTester(QObject):
@@ -927,6 +1048,86 @@ class LatencyTester(QObject):
             self.error.emit(self._role_key, msg)
 
 
+class SmoothScrollArea(QScrollArea):
+    """QScrollArea with animated, accumulating wheel scroll."""
+
+    _PX_PER_TICK = 45    # pixels scrolled per standard wheel tick (angleDelta == 120)
+    _DURATION_MS  = 220  # animation duration in ms
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scroll_target = 0
+        self._anim_active = False
+        self._scroll_anim = QPropertyAnimation(self.verticalScrollBar(), b"value", self)
+        self._scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._scroll_anim.setDuration(self._DURATION_MS)
+        self._scroll_anim.finished.connect(self._on_scroll_done)
+
+    def _on_scroll_done(self) -> None:
+        self._anim_active = False
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+
+        vbar = self.verticalScrollBar()
+        # When already animating, accumulate from the target so rapid spins stack up
+        # rather than each one restarting from the momentary position.
+        base = self._scroll_target if self._anim_active else vbar.value()
+        pixels = -int(delta / 120.0 * self._PX_PER_TICK)
+        new_target = max(vbar.minimum(), min(vbar.maximum(), base + pixels))
+        self._scroll_target = new_target
+
+        self._scroll_anim.stop()
+        self._anim_active = False
+        self._scroll_anim.setStartValue(vbar.value())
+        self._scroll_anim.setEndValue(new_target)
+        self._scroll_anim.start()
+        self._anim_active = True
+        event.accept()
+
+
+class SmoothListWidget(QListWidget):
+    """QListWidget with animated, accumulating wheel scroll."""
+
+    _PX_PER_TICK = 1
+    _DURATION_MS  = 150
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scroll_target = 0
+        self._anim_active = False
+        self._scroll_anim = QPropertyAnimation(self.verticalScrollBar(), b"value", self)
+        self._scroll_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._scroll_anim.setDuration(self._DURATION_MS)
+        self._scroll_anim.finished.connect(self._on_scroll_done)
+
+    def _on_scroll_done(self) -> None:
+        self._anim_active = False
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        if delta == 0:
+            super().wheelEvent(event)
+            return
+
+        vbar = self.verticalScrollBar()
+        base = self._scroll_target if self._anim_active else vbar.value()
+        pixels = -int(delta / 120.0 * self._PX_PER_TICK)
+        new_target = max(vbar.minimum(), min(vbar.maximum(), base + pixels))
+        self._scroll_target = new_target
+
+        self._scroll_anim.stop()
+        self._anim_active = False
+        self._scroll_anim.setStartValue(vbar.value())
+        self._scroll_anim.setEndValue(new_target)
+        self._scroll_anim.start()
+        self._anim_active = True
+        event.accept()
+
+
 class LiteLLMGui(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -942,6 +1143,19 @@ class LiteLLMGui(QMainWindow):
         self._heartbeat_checker: ProxyChecker | None = None
         self._heartbeat_inflight = False
         self._heartbeat_misses = 0
+
+        # Animation state
+        self._pulse_anim: QSequentialAnimationGroup | None = None
+        self._status_effect: QGraphicsOpacityEffect | None = None
+        self._sidebar_anim: QPropertyAnimation | None = None
+
+        # Session spend tracking
+        self._session_baseline: float | None = None
+        self._spend_inflight = False
+
+        # Per-model spend tracking (LiteLLM proxy DB)
+        self._model_spend_baseline: dict[str, float] | None = None
+        self._model_spend_inflight = False
 
         # Load saved key + session before building UI
         settings = load_settings()
@@ -961,6 +1175,10 @@ class LiteLLMGui(QMainWindow):
         self._populate_profiles()
         self._sync_menu_actions()
 
+        if settings.get("sidebar_collapsed", False):
+            self._left_panel.setVisible(False)
+            self._sidebar_expand_btn.setVisible(True)
+
         self._flash_state = False
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(500)
@@ -969,6 +1187,14 @@ class LiteLLMGui(QMainWindow):
         self._heartbeat_timer = QTimer(self)
         self._heartbeat_timer.setInterval(5000)
         self._heartbeat_timer.timeout.connect(self._heartbeat_tick)
+
+        self._spend_timer = QTimer(self)
+        self._spend_timer.setInterval(30_000)
+        self._spend_timer.timeout.connect(self._poll_spend)
+
+        self._model_spend_timer = QTimer(self)
+        self._model_spend_timer.setInterval(30_000)
+        self._model_spend_timer.timeout.connect(self._poll_model_spend)
 
         self._loading_session = False
 
@@ -982,9 +1208,32 @@ class LiteLLMGui(QMainWindow):
 
     # ── UI Setup ──────────────────────────────────────────────────────
 
+    def _apply_window_icon(self) -> None:
+        svg_path = Path(__file__).resolve().parent / "icon.svg"
+        if not svg_path.exists():
+            return
+        try:
+            from PySide6.QtSvg import QSvgRenderer
+            from PySide6.QtGui import QPixmap, QPainter
+            renderer = QSvgRenderer(str(svg_path))
+            icon = QIcon()
+            for size in (16, 24, 32, 48, 64, 128, 256):
+                pix = QPixmap(size, size)
+                pix.fill(Qt.GlobalColor.transparent)
+                p = QPainter(pix)
+                renderer.render(p)
+                p.end()
+                icon.addPixmap(pix)
+        except Exception:
+            icon = QIcon(str(svg_path))
+        self.setWindowIcon(icon)
+        if app := QApplication.instance():
+            app.setWindowIcon(icon)
+
     def _setup_ui(self) -> None:
         self.setWindowTitle("LiteLLM Configurator")
         self.setMinimumSize(1080, 720)
+        self._apply_window_icon()
 
         self._build_menu_bar()
 
@@ -995,18 +1244,27 @@ class LiteLLMGui(QMainWindow):
         root.setSpacing(0)
 
         # ── Left Panel: Profiles ──
-        left_panel = QWidget()
-        left_panel.setFixedWidth(220)
-        left_panel.setObjectName("side-panel")
-        left_layout = QVBoxLayout(left_panel)
+        self._left_panel = QWidget()
+        self._left_panel.setFixedWidth(220)
+        self._left_panel.setObjectName("side-panel")
+        left_layout = QVBoxLayout(self._left_panel)
         left_layout.setContentsMargins(12, 16, 12, 16)
         left_layout.setSpacing(8)
 
+        sidebar_heading_row = QHBoxLayout()
+        sidebar_heading_row.setContentsMargins(0, 0, 0, 0)
         heading = QLabel("Profiles")
         heading.setObjectName("heading")
-        left_layout.addWidget(heading)
+        sidebar_heading_row.addWidget(heading)
+        sidebar_heading_row.addStretch()
+        self._sidebar_collapse_btn = QPushButton("‹")
+        self._sidebar_collapse_btn.setObjectName("sidebar-toggle")
+        self._sidebar_collapse_btn.setToolTip("Hide Profiles")
+        self._sidebar_collapse_btn.clicked.connect(self._toggle_sidebar)
+        sidebar_heading_row.addWidget(self._sidebar_collapse_btn)
+        left_layout.addLayout(sidebar_heading_row)
 
-        self.profile_list = QListWidget()
+        self.profile_list = SmoothListWidget()
         self.profile_list.currentItemChanged.connect(self._on_profile_selected)
         left_layout.addWidget(self.profile_list, stretch=1)
 
@@ -1020,7 +1278,7 @@ class LiteLLMGui(QMainWindow):
         delete_btn.clicked.connect(self._delete_profile)
         left_layout.addWidget(delete_btn)
 
-        root.addWidget(left_panel)
+        root.addWidget(self._left_panel)
 
         # ── Right Panel Content ──
         right = QWidget()
@@ -1028,8 +1286,14 @@ class LiteLLMGui(QMainWindow):
         right_layout.setContentsMargins(20, 16, 20, 16)
         right_layout.setSpacing(12)
 
-        # Header
+        # Header — expand button appears here when sidebar is collapsed
         header_row = QHBoxLayout()
+        self._sidebar_expand_btn = QPushButton("›")
+        self._sidebar_expand_btn.setObjectName("sidebar-toggle")
+        self._sidebar_expand_btn.setToolTip("Show Profiles")
+        self._sidebar_expand_btn.setVisible(False)
+        self._sidebar_expand_btn.clicked.connect(self._toggle_sidebar)
+        header_row.addWidget(self._sidebar_expand_btn)
         title = QLabel("LiteLLM Model Selector")
         title.setObjectName("heading")
         header_row.addWidget(title)
@@ -1046,7 +1310,7 @@ class LiteLLMGui(QMainWindow):
 
         right_layout.addLayout(header_row)
 
-        # Port row
+        # Port row: Port input on the left; the four action buttons fill the right.
         port_row = QHBoxLayout()
         port_lbl = QLabel("Port:")
         port_lbl.setObjectName("status")
@@ -1056,6 +1320,31 @@ class LiteLLMGui(QMainWindow):
         self.port_input.textChanged.connect(self._on_port_changed)
         port_row.addWidget(self.port_input)
         port_row.addStretch()
+
+        port_row.setSpacing(10)
+
+        self.launch_btn = QPushButton("Launch Proxy")
+        self.launch_btn.setObjectName("primary")
+        self.launch_btn.clicked.connect(self._launch_proxy)
+        port_row.addWidget(self.launch_btn)
+
+        self.kill_btn = QPushButton("Kill Proxy")
+        self.kill_btn.setObjectName("danger")
+        self.kill_btn.setEnabled(False)
+        self.kill_btn.clicked.connect(self._kill_proxy)
+        port_row.addWidget(self.kill_btn)
+
+        self.open_terminal_btn = QPushButton("Open Terminal")
+        self.open_terminal_btn.setObjectName("accent")
+        self.open_terminal_btn.setEnabled(False)
+        self.open_terminal_btn.clicked.connect(self._open_terminal)
+        port_row.addWidget(self.open_terminal_btn)
+
+        self.latency_btn = QPushButton("Test Latency")
+        self.latency_btn.setEnabled(False)
+        self.latency_btn.clicked.connect(self._test_latency)
+        port_row.addWidget(self.latency_btn)
+
         right_layout.addLayout(port_row)
 
         # Project directory row
@@ -1073,22 +1362,28 @@ class LiteLLMGui(QMainWindow):
         right_layout.addLayout(proj_row)
 
         # ── Role selector cards ──
-        cards_layout = QHBoxLayout()
-        cards_layout.setSpacing(12)
+        cards_container = QWidget()
+        cards_hbox = QHBoxLayout(cards_container)
+        cards_hbox.setContentsMargins(0, 0, 0, 0)
+        cards_hbox.setSpacing(12)
 
         self.advisor_widget = ModelSearchWidget("Advisor", "claude-opus-4-7", [])
         self.advisor_widget.model_selected.connect(lambda mid: self._on_model_changed("advisor", mid))
-        cards_layout.addWidget(self.advisor_widget)
+        cards_hbox.addWidget(self.advisor_widget)
 
         self.agent_widget = ModelSearchWidget("Agent", "claude-sonnet-4-6", [])
         self.agent_widget.model_selected.connect(lambda mid: self._on_model_changed("agent", mid))
-        cards_layout.addWidget(self.agent_widget)
+        cards_hbox.addWidget(self.agent_widget)
 
         self.subagent_widget = ModelSearchWidget("Subagent", "claude-*", [])
         self.subagent_widget.model_selected.connect(lambda mid: self._on_model_changed("subagent", mid))
-        cards_layout.addWidget(self.subagent_widget)
+        cards_hbox.addWidget(self.subagent_widget)
 
-        right_layout.addLayout(cards_layout, stretch=1)
+        # ── Lower panel (vision + cost + log + cmd) ──
+        lower_panel = QWidget()
+        lower_layout = QVBoxLayout(lower_panel)
+        lower_layout.setContentsMargins(0, 0, 0, 0)
+        lower_layout.setSpacing(8)
 
         # ── Vision fallback row ──
         vision_row = QHBoxLayout()
@@ -1102,7 +1397,7 @@ class LiteLLMGui(QMainWindow):
         self.vision_hint = QLabel("")
         self.vision_hint.setObjectName("status")
         vision_row.addWidget(self.vision_hint, stretch=1)
-        right_layout.addLayout(vision_row)
+        lower_layout.addLayout(vision_row)
 
         # ── Cost Summary Bar ──
         cost_frame = QFrame()
@@ -1113,7 +1408,34 @@ class LiteLLMGui(QMainWindow):
         self.cost_label.setObjectName("cost-label")
         cost_layout.addWidget(self.cost_label)
         cost_layout.addStretch()
-        right_layout.addWidget(cost_frame)
+        self.session_spend_label = QLabel("Session: —")
+        self.session_spend_label.setObjectName("session-spend")
+        cost_layout.addWidget(self.session_spend_label)
+        reset_spend_btn = QPushButton("Reset")
+        reset_spend_btn.setFixedWidth(80)
+        reset_spend_btn.setToolTip("Reset session spend baseline to now")
+        reset_spend_btn.clicked.connect(self._reset_spend_baseline)
+        cost_layout.addWidget(reset_spend_btn)
+        lower_layout.addWidget(cost_frame)
+
+        # ── Per-model spend bar (live, from LiteLLM spend DB) ──
+        model_spend_frame = QFrame()
+        model_spend_frame.setObjectName("card")
+        model_spend_layout = QHBoxLayout(model_spend_frame)
+        model_spend_layout.setContentsMargins(14, 8, 14, 8)
+        ms_title = QLabel("Per-role tokens (this session):")
+        ms_title.setToolTip(
+            "Token volume per role since you launched/reset, from "
+            "~/.claude/litellm-session-log.jsonl. Actual $ spend appears in "
+            "the green Session pill above (live from OpenRouter)."
+        )
+        ms_title.setObjectName("cost-label")
+        model_spend_layout.addWidget(ms_title)
+        model_spend_layout.addStretch()
+        self.model_spend_label = QLabel("—")
+        self.model_spend_label.setObjectName("session-spend")
+        model_spend_layout.addWidget(self.model_spend_label)
+        lower_layout.addWidget(model_spend_frame)
 
         # ── Log / Status area ──
         log_header = QHBoxLayout()
@@ -1124,53 +1446,95 @@ class LiteLLMGui(QMainWindow):
         open_log_btn = QPushButton("Open Log File")
         open_log_btn.clicked.connect(self._open_proxy_log)
         log_header.addWidget(open_log_btn)
-        right_layout.addLayout(log_header)
+        lower_layout.addLayout(log_header)
 
         self.log_area = QPlainTextEdit()
         self.log_area.setReadOnly(True)
         self.log_area.setMaximumBlockCount(500)
         self.log_area.setMinimumHeight(100)
-        right_layout.addWidget(self.log_area)
+        lower_layout.addWidget(self.log_area, stretch=1)
 
-        # ── Action buttons ──
-        action_row = QHBoxLayout()
-        action_row.setSpacing(10)
+        # ── Inline command runner ──
+        cmd_row = QHBoxLayout()
+        cmd_row.setSpacing(6)
+        cmd_prompt = QLabel(">")
+        cmd_prompt.setObjectName("status")
+        cmd_row.addWidget(cmd_prompt)
+        self.cmd_input = QLineEdit()
+        self.cmd_input.setPlaceholderText(
+            "Run a command (e.g. python tools/litellm_usage.py --by both) — Help → Helpful Commands"
+        )
+        self.cmd_input.returnPressed.connect(self._run_inline_command)
+        cmd_row.addWidget(self.cmd_input, stretch=1)
+        run_btn = QPushButton("Run")
+        run_btn.setMinimumWidth(80)
+        run_btn.clicked.connect(self._run_inline_command)
+        cmd_row.addWidget(run_btn)
+        lower_layout.addLayout(cmd_row)
 
-        self.launch_btn = QPushButton("Launch Proxy")
-        self.launch_btn.setObjectName("primary")
-        self.launch_btn.clicked.connect(self._launch_proxy)
-        action_row.addWidget(self.launch_btn)
-
-        self.kill_btn = QPushButton("Kill Proxy")
-        self.kill_btn.setObjectName("danger")
-        self.kill_btn.setEnabled(False)
-        self.kill_btn.clicked.connect(self._kill_proxy)
-        action_row.addWidget(self.kill_btn)
-
-        self.open_terminal_btn = QPushButton("Open Terminal")
-        self.open_terminal_btn.setObjectName("accent")
-        self.open_terminal_btn.setEnabled(False)
-        self.open_terminal_btn.clicked.connect(self._open_terminal)
-        action_row.addWidget(self.open_terminal_btn)
-
-        self.latency_btn = QPushButton("Test Latency")
-        self.latency_btn.setEnabled(False)
-        self.latency_btn.clicked.connect(self._test_latency)
-        action_row.addWidget(self.latency_btn)
-
-        action_row.addStretch()
-        right_layout.addLayout(action_row)
+        # ── Vertical splitter: cards ↕ lower panel ──
+        self._right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._right_splitter.addWidget(cards_container)
+        self._right_splitter.addWidget(lower_panel)
+        self._right_splitter.setStretchFactor(0, 2)
+        self._right_splitter.setStretchFactor(1, 1)
+        right_layout.addWidget(self._right_splitter, stretch=1)
 
         # Wrap the right panel in a scroll area so that when the content is taller
         # than the window, it scrolls instead of compressing widgets into overlap.
         # This makes the recurring "model name overlaps the list" bug structurally
         # impossible — every widget always gets its natural height.
-        scroll = QScrollArea()
+        scroll = SmoothScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(right)
         root.addWidget(scroll, stretch=1)
+
+    def _toggle_sidebar(self) -> None:
+        # Stop any in-progress animation before reversing direction.
+        if self._sidebar_anim is not None:
+            self._sidebar_anim.stop()
+            self._sidebar_anim = None
+
+        visible = self._left_panel.isVisible()
+        # The expand button lives outside the panel so it must be toggled explicitly.
+        self._sidebar_expand_btn.setVisible(visible)
+        s = load_settings()
+        s["sidebar_collapsed"] = visible
+        save_settings(s)
+
+        if visible:
+            # Collapse — shrink max-width to 0, then hide.
+            self._left_panel.setMinimumWidth(0)
+            anim = QPropertyAnimation(self._left_panel, b"maximumWidth", self)
+            anim.setDuration(210)
+            anim.setStartValue(self._left_panel.width())
+            anim.setEndValue(0)
+            anim.setEasingCurve(QEasingCurve.Type.InCubic)
+            def _on_collapsed():
+                self._left_panel.setVisible(False)
+                self._left_panel.setMinimumWidth(220)
+                self._left_panel.setMaximumWidth(220)
+                self._sidebar_anim = None
+            anim.finished.connect(_on_collapsed)
+        else:
+            # Expand — show at 0-width then grow to full.
+            self._left_panel.setMinimumWidth(0)
+            self._left_panel.setMaximumWidth(0)
+            self._left_panel.setVisible(True)
+            anim = QPropertyAnimation(self._left_panel, b"maximumWidth", self)
+            anim.setDuration(240)
+            anim.setStartValue(0)
+            anim.setEndValue(220)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            def _on_expanded():
+                self._left_panel.setFixedWidth(220)
+                self._sidebar_anim = None
+            anim.finished.connect(_on_expanded)
+
+        self._sidebar_anim = anim
+        anim.start()
 
     def _build_menu_bar(self) -> None:
         bar = self.menuBar()
@@ -1232,6 +1596,11 @@ class LiteLLMGui(QMainWindow):
 
         # ── Help ──
         help_menu = bar.addMenu("&Help")
+        cmds_action = QAction("Helpful &Commands…", self)
+        cmds_action.setShortcut("F1")
+        cmds_action.triggered.connect(self._show_helpful_commands)
+        help_menu.addAction(cmds_action)
+        help_menu.addSeparator()
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
@@ -1268,6 +1637,82 @@ class LiteLLMGui(QMainWindow):
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if not open_path(CONFIG_DIR):
             self._log(f"Could not open config folder: {CONFIG_DIR}")
+
+    def _run_inline_command(self) -> None:
+        """Execute the typed command via PowerShell and append output to the log."""
+        cmd = self.cmd_input.text().strip()
+        if not cmd:
+            return
+        self.cmd_input.clear()
+        self._log(f"$ {cmd}")
+        try:
+            cwd = str(Path(sys.argv[0]).parent.resolve())
+            # Run via PowerShell so the user can mix shell builtins and our python tools.
+            # Force UTF-8 and prefer the project venv's python if present.
+            venv_python = Path(cwd) / ".venv" / "Scripts" / "python.exe"
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"}
+            if venv_python.exists():
+                # Make `python` resolve to the venv python inside the command shell.
+                env["PATH"] = str(venv_python.parent) + os.pathsep + env.get("PATH", "")
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],
+                cwd=cwd, env=env, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120,
+            )
+            out = (proc.stdout or "").rstrip()
+            err = (proc.stderr or "").rstrip()
+            if out:
+                self._log(out)
+            if err:
+                self._log(err)
+            if proc.returncode != 0 and not out and not err:
+                self._log(f"(exit {proc.returncode})")
+        except subprocess.TimeoutExpired:
+            self._log("(command timed out after 120s)")
+        except Exception as exc:
+            self._log(f"(command failed: {exc})")
+
+    def _show_helpful_commands(self) -> None:
+        """Show a dialog listing common diagnostic commands."""
+        commands = [
+            ("Per-model usage (all-time)", "python tools/litellm_usage.py"),
+            ("Per-model usage by alias→upstream", "python tools/litellm_usage.py --by both"),
+            ("Usage in the last hour", "python tools/litellm_usage.py --by both --since 1h"),
+            ("Tail last 20 requests", "python tools/litellm_recent.py --n 20"),
+            ("Live tail (follow)", "python tools/litellm_recent.py --follow"),
+            ("Filter to current terminal session", "python tools/litellm_recent.py --session $env:CLAUDE_SESSION_ID"),
+            ("List models the running proxy knows", "curl -s http://localhost:4001/v1/models -H 'Authorization: Bearer sk-local-fake'"),
+            ("Probe each route directly", "python tools/litellm_probe.py"),
+            ("Latency check", "python tools/litellm_probe.py --latency"),
+            ("Show the generated yaml", "Get-Content $env:USERPROFILE\\.claude\\litellm-select.yaml"),
+            ("Open precall debug log", "Get-Content $env:USERPROFILE\\.claude\\litellm-precall-full.jsonl -Tail 5"),
+            ("Kill any proxy on 4001", "Get-Process litellm -ErrorAction SilentlyContinue | Stop-Process -Force"),
+        ]
+        # Build a clickable list dialog.
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Helpful Commands")
+        dlg.setMinimumWidth(640)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(
+            "Double-click a command to copy it into the runner below the proxy log."
+        ))
+        listw = QListWidget()
+        for label, cmd in commands:
+            item = QListWidgetItem(f"{label}\n    {cmd}")
+            item.setData(Qt.UserRole, cmd)
+            listw.addItem(item)
+
+        def _on_double_click(item):
+            self.cmd_input.setText(item.data(Qt.UserRole))
+            self.cmd_input.setFocus()
+            dlg.accept()
+
+        listw.itemDoubleClicked.connect(_on_double_click)
+        layout.addWidget(listw, stretch=1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.reject)
+        layout.addWidget(close_btn)
+        dlg.exec()
 
     def _open_proxy_log(self) -> None:
         if not LITELLM_LOG_PATH.exists():
@@ -1401,6 +1846,8 @@ class LiteLLMGui(QMainWindow):
 
     def _handle_proxy_lost(self) -> None:
         self._stop_heartbeat()
+        self._stop_spend_polling()
+        self._stop_model_spend_polling()
         self._proxy_running = False
         self._litellm_pid = None
         self._set_status("●  Disconnected", "bad")
@@ -1417,19 +1864,45 @@ class LiteLLMGui(QMainWindow):
 
     def _set_status(self, text: str, style: str, flashing: bool = False) -> None:
         self._flash_timer.stop()
+
+        # Stop any running pulse and restore full opacity before any change.
+        if self._pulse_anim is not None:
+            self._pulse_anim.stop()
+            self._pulse_anim = None
+        if self._status_effect is not None:
+            self._status_effect.setOpacity(1.0)
+
         self.status_indicator.setText(text)
         self.status_indicator.setObjectName(style)
         self.status_indicator.style().unpolish(self.status_indicator)
         self.status_indicator.style().polish(self.status_indicator)
+
         if flashing:
-            self._flash_state = True
-            self._flash_timer.start()
+            if self._status_effect is None:
+                self._status_effect = QGraphicsOpacityEffect(self.status_indicator)
+                self.status_indicator.setGraphicsEffect(self._status_effect)
+            self._status_effect.setOpacity(1.0)
+
+            fade_out = QPropertyAnimation(self._status_effect, b"opacity", self)
+            fade_out.setDuration(650)
+            fade_out.setStartValue(1.0)
+            fade_out.setEndValue(0.15)
+            fade_out.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+            fade_in = QPropertyAnimation(self._status_effect, b"opacity", self)
+            fade_in.setDuration(650)
+            fade_in.setStartValue(0.15)
+            fade_in.setEndValue(1.0)
+            fade_in.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+            self._pulse_anim = QSequentialAnimationGroup(self)
+            self._pulse_anim.addAnimation(fade_out)
+            self._pulse_anim.addAnimation(fade_in)
+            self._pulse_anim.setLoopCount(-1)
+            self._pulse_anim.start()
 
     def _tick_status_flash(self) -> None:
-        self._flash_state = not self._flash_state
-        dot = "●" if self._flash_state else "○"
-        current = self.status_indicator.text()
-        self.status_indicator.setText(dot + current[1:])
+        pass  # replaced by smooth opacity pulse in _set_status
 
     def _start_loading_models(self) -> None:
         if getattr(self, "_fetching", False):
@@ -1695,6 +2168,8 @@ class LiteLLMGui(QMainWindow):
         self.latency_btn.setEnabled(True)
         self._sync_menu_actions()
         self._start_heartbeat()
+        self._start_spend_polling()
+        self._start_model_spend_polling()
         self._log(f"Detected existing proxy on port {self._port}.")
         self._log("  (Kill it or launch a new one on a different port.)")
 
@@ -1770,6 +2245,8 @@ class LiteLLMGui(QMainWindow):
         self.latency_btn.setEnabled(True)
         self._sync_menu_actions()
         self._start_heartbeat()
+        self._start_spend_polling()
+        self._start_model_spend_polling()
         self._log(f"LiteLLM is running on port {self._port} (PID {self._litellm_pid}).")
         self._update_claude_md()
 
@@ -1793,6 +2270,8 @@ class LiteLLMGui(QMainWindow):
     def _on_proxy_killed(self) -> None:
         self._proxy_running = False
         self._stop_heartbeat()
+        self._stop_spend_polling()
+        self._stop_model_spend_polling()
         self._set_status("●  Disconnected", "bad")
         self.launch_btn.setEnabled(True)
         self.kill_btn.setEnabled(False)
@@ -1856,6 +2335,132 @@ class LiteLLMGui(QMainWindow):
             self.latency_btn.setEnabled(True)
             self._log("  Latency errors can put models into cooldown — kill and relaunch the proxy to reset.")
 
+    # ── Session spend monitoring ──────────────────────────────────────
+
+    def _start_spend_polling(self) -> None:
+        self._spend_inflight = False
+        self._spend_timer.start()
+        self._poll_spend()  # immediate first poll sets the baseline
+
+    def _stop_spend_polling(self) -> None:
+        self._spend_timer.stop()
+        self._spend_inflight = False
+
+    def _poll_spend(self) -> None:
+        if self._spend_inflight:
+            return
+        self._spend_inflight = True
+        self._spend_worker = SpendPoller()
+        self._spend_worker.result.connect(self._on_spend_result)
+        self._spend_worker.error.connect(self._on_spend_error)
+        threading.Thread(target=self._spend_worker.run, daemon=True).start()
+
+    def _on_spend_result(self, total_usage: float) -> None:
+        self._spend_inflight = False
+        if self._session_baseline is None:
+            self._session_baseline = total_usage
+        delta = max(0.0, total_usage - self._session_baseline)
+        self.session_spend_label.setText(f"Session: ${delta:.4f}")
+
+    def _on_spend_error(self, _err: str) -> None:
+        self._spend_inflight = False  # fail silently; don't spam the log
+
+    def _reset_spend_baseline(self) -> None:
+        self._session_baseline = None
+        self.session_spend_label.setText("Session: —")
+        self._model_spend_baseline = None
+        self.model_spend_label.setText("—")
+        if self._proxy_running:
+            self._poll_spend()
+            self._poll_model_spend()
+
+    # ── Per-model spend monitoring (LiteLLM proxy DB) ─────────────────
+
+    def _start_model_spend_polling(self) -> None:
+        self._model_spend_inflight = False
+        self._model_spend_timer.start()
+        self._poll_model_spend()  # immediate first poll sets the baseline
+
+    def _stop_model_spend_polling(self) -> None:
+        self._model_spend_timer.stop()
+        self._model_spend_inflight = False
+
+    def _poll_model_spend(self) -> None:
+        if self._model_spend_inflight:
+            return
+        self._model_spend_inflight = True
+        self._model_spend_worker = ModelSpendPoller(self._port)
+        self._model_spend_worker.result.connect(self._on_model_spend_result)
+        self._model_spend_worker.error.connect(self._on_model_spend_error)
+        threading.Thread(target=self._model_spend_worker.run, daemon=True).start()
+
+    def _on_model_spend_result(self, totals: dict) -> None:
+        self._model_spend_inflight = False
+        # Group aliases by role using the same routing rules the proxy uses:
+        # exact alias match first, then the claude-* wildcard for subagent.
+        role_for_alias: dict[str, str] = {}
+        for role_key, alias, _ in ROLES:
+            if alias == "claude-*":
+                continue  # handled as catch-all below
+            role_for_alias[alias] = role_key
+        for extras_role, extras in ROLE_EXTRA_ALIASES.items():
+            for extra in extras:
+                role_for_alias[extra] = extras_role
+
+        per_role: dict[str, float] = {}
+        for alias, tokens in totals.items():
+            role = role_for_alias.get(alias)
+            if role is None and alias.startswith("claude-"):
+                role = "subagent"  # wildcard catch-all
+            if role is None:
+                # Alias not captured (old proxy log entries before lc_alias fix);
+                # bucket under "_unknown" so we can still show a total.
+                role = "_unknown"
+            per_role[role] = per_role.get(role, 0.0) + float(tokens)
+
+        if self._model_spend_baseline is None:
+            self._model_spend_baseline = dict(per_role)
+        deltas: dict[str, float] = {}
+        baseline = self._model_spend_baseline
+        for role, total in per_role.items():
+            base = baseline.get(role, 0.0)
+            delta = total - base
+            if delta > 0:
+                deltas[role] = delta
+
+        if not deltas:
+            self.model_spend_label.setText("—")
+            return
+
+        def _fmt(n: float) -> str:
+            if n >= 1_000_000:
+                return f"{n/1_000_000:.2f}M"
+            if n >= 1_000:
+                return f"{n/1_000:.1f}k"
+            return f"{int(n)}"
+
+        unknown_tokens = deltas.pop("_unknown", 0.0)
+        role_deltas = {k: v for k, v in deltas.items() if k in ("advisor", "agent", "subagent")}
+
+        if not role_deltas:
+            # All tokens had unresolvable aliases — show total with a hint.
+            self.model_spend_label.setText(
+                f"Total: {_fmt(unknown_tokens)} tokens  (relaunch proxy for per-role breakdown)"
+            )
+            return
+
+        labels = {"advisor": "Advisor", "agent": "Agent", "subagent": "Subagent"}
+        parts = [f"{labels.get(r, r)}: {_fmt(t)}" for r, t in
+                 sorted(role_deltas.items(), key=lambda kv: ("advisor","agent","subagent").index(kv[0])
+                        if kv[0] in ("advisor","agent","subagent") else 99)]
+        total_tokens = sum(role_deltas.values()) + unknown_tokens
+        self.model_spend_label.setText(
+            "  |  ".join(parts) + f"  —  Total: {_fmt(total_tokens)} tokens"
+        )
+
+    def _on_model_spend_error(self, _err: str) -> None:
+        self._model_spend_inflight = False  # fail silently
+
     def _update_claude_md(self) -> None:
         models = {
             "advisor": self.advisor_widget.selected_model() or "",
@@ -1874,6 +2479,19 @@ class LiteLLMGui(QMainWindow):
 # ── Entry ─────────────────────────────────────────────────────────────
 
 def main() -> None:
+    if sys.platform == "win32" and "pythonw" not in sys.executable.lower():
+        pythonw = Path(sys.executable).parent / "pythonw.exe"
+        if pythonw.exists():
+            subprocess.Popen([str(pythonw)] + sys.argv)
+            return
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "LiteLLMConfigurator.1"
+            )
+        except Exception:
+            pass
     app = QApplication.instance() or QApplication(sys.argv)
     window = LiteLLMGui()
     window.show()

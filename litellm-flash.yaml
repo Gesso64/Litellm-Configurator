@@ -9,6 +9,11 @@ model_list:
       model: openrouter/anthropic/claude-opus-4.6
       api_key: "os.environ/OPENROUTER_API_KEY"
 
+  - model_name: claude-opus-4-8
+    litellm_params:
+      model: openrouter/anthropic/claude-opus-4.6
+      api_key: "os.environ/OPENROUTER_API_KEY"
+
   - model_name: "claude-*"
     litellm_params:
       model: openrouter/deepseek/deepseek-v4-flash

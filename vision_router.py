@@ -129,6 +129,78 @@ class VisionRouter(CustomLogger):
     # ── the hook ───────────────────────────────────────────────────────
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        # Diagnostic: log the FULL request shape so we can diff a failing one against curl.
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            from datetime import datetime, timezone
+            dbg = _Path.home() / ".claude" / "litellm-precall-full.jsonl"
+            if isinstance(data, dict):
+                # Pull headers (LiteLLM nests them in metadata.headers)
+                md = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+                headers = md.get("headers") if isinstance(md, dict) else None
+                # Redact obvious secrets in headers before persisting.
+                if isinstance(headers, dict):
+                    headers = {
+                        k: ("***REDACTED***" if any(s in (k or "").lower() for s in ("api-key","api_key","authorization","x-key")) else v)
+                        for k, v in headers.items()
+                    }
+                # Make a copy of data with messages trimmed (keep first message only, length-marker for rest)
+                _data_copy = {}
+                for k, v in data.items():
+                    if k == "messages" and isinstance(v, list):
+                        _data_copy["messages_count"] = len(v)
+                        _data_copy["messages_first"] = v[0] if v else None
+                        _data_copy["messages_last"] = v[-1] if len(v) > 1 else None
+                    elif k == "tools" and isinstance(v, list):
+                        _data_copy["tools_count"] = len(v)
+                        _data_copy["tools_full"] = [
+                            {
+                                "name": (t.get("name") if isinstance(t, dict) else None),
+                                "type": (t.get("type") if isinstance(t, dict) else None),
+                                "model": (t.get("model") if isinstance(t, dict) else None),
+                                "api_base": (t.get("api_base") if isinstance(t, dict) else None),
+                                "api_key_present": (bool(t.get("api_key")) if isinstance(t, dict) else None),
+                            }
+                            for t in v
+                        ]
+                    else:
+                        _data_copy[k] = v
+                snapshot = {
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                    "call_type": call_type,
+                    "headers": headers,
+                    "data": _data_copy,
+                }
+                with dbg.open("a", encoding="utf-8") as f:
+                    f.write(_json.dumps(snapshot, default=str) + "\n")
+        except Exception:
+            pass
+        # ── advisor-tool routing fix ──────────────────────────────────
+        # LiteLLM 1.89.3 has a built-in AdvisorOrchestrationHandler that
+        # intercepts requests containing an advisor_20260301 tool. When that
+        # interceptor makes its sub-call to the advisor model, it ignores
+        # ANTHROPIC_BASE_URL and goes direct to api.anthropic.com — using
+        # whatever ambient api_key it finds (our master key 'sk-local-fake')
+        # → 401 Unauthorized. The interceptor only routes correctly if the
+        # advisor tool definition itself carries api_base + api_key. Claude
+        # Code does not set them. Inject them here so the sub-call comes
+        # back to *this* proxy and routes through the configured deployment.
+        try:
+            if isinstance(data, dict):
+                _tools = data.get("tools")
+                if isinstance(_tools, list):
+                    for _t in _tools:
+                        if not isinstance(_t, dict):
+                            continue
+                        if _t.get("type") == "advisor_20260301":
+                            if not _t.get("api_base"):
+                                _t["api_base"] = "http://localhost:4001"
+                            if not _t.get("api_key"):
+                                _t["api_key"] = "sk-local-fake"
+        except Exception:
+            pass
+
         try:
             self._load_config()
             if not self._enabled or not self._fallback_alias:
