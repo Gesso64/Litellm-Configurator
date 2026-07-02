@@ -3,7 +3,14 @@
 Writes to ~/.claude/litellm-session-log.jsonl. Each line:
   timestamp_utc, request_id, alias_requested, upstream_model,
   prompt_tokens, completion_tokens, latency_ms, status, error, session_id,
-  user, ip
+  user, ip, tool_hallucination
+
+tool_hallucination: true when the request included tools but the model
+returned text-only output containing phrases that deny tool availability.
+This detects the silent failure mode where a proxied non-Anthropic model
+ignores tool schemas under long context and hallucinates refusal text.
+Flagged calls are also written to ~/.claude/litellm-tool-hallucination.jsonl
+with a text snippet for diagnosis.
 
 Registered in the proxy config via:
 
@@ -37,6 +44,35 @@ LOG_PATH = Path(os.environ.get(
     "LITELLM_SESSION_LOG",
     str(Path.home() / ".claude" / "litellm-session-log.jsonl"),
 ))
+HALLUCINATION_LOG_PATH = LOG_PATH.parent / "litellm-tool-hallucination.jsonl"
+
+# When a request has tools AND estimated prompt tokens exceed this threshold,
+# the pre-call hook swaps the model to TOOL_CONTEXT_FALLBACK_MODEL so that
+# a reliable model handles the long-context agentic call instead of a budget
+# model that silently drops tool calls.
+TOOL_CONTEXT_THRESHOLD = int(os.environ.get("TOOL_CONTEXT_THRESHOLD", "120000"))
+TOOL_CONTEXT_FALLBACK_MODEL = os.environ.get(
+    "TOOL_CONTEXT_FALLBACK_MODEL",
+    "claude-opus-4-7",  # already in every YAML → openrouter/anthropic/claude-opus-4.6
+)
+
+# Phrases that indicate a model denied tool use in plain text.
+# Only flagged when (a) the request included tools AND (b) response had no tool calls.
+_TOOL_DENIAL_PHRASES = [
+    "the tool is not available",
+    "tools are not available",
+    "tool isn't available",
+    "i don't have the necessary tools",
+    "i don't have access to the",
+    "i am unable to directly modify",
+    "i can't seem to modify",
+    "cannot use the",
+    "i'm unable to use",
+    "unable to directly",
+    "edit tool",        # catches "the edit tool is not available" etc.
+    "write tool",
+    "don't have the ability to",
+]
 
 
 def _now_iso() -> str:
@@ -52,6 +88,88 @@ def _safe_get(d, *keys, default=None):
         if cur is None:
             return default
     return cur
+
+
+def _request_had_tools(kwargs: dict) -> bool:
+    """Return True if the original request body contained a non-empty tools list."""
+    try:
+        psr = kwargs.get("proxy_server_request") or {}
+        body = psr.get("body") if isinstance(psr, dict) else None
+        if isinstance(body, dict):
+            tools = body.get("tools")
+            return bool(tools and isinstance(tools, list))
+    except Exception:
+        pass
+    return False
+
+
+def _extract_response_text(response_obj) -> str:
+    """Pull all text content out of a litellm ModelResponse."""
+    try:
+        choices = getattr(response_obj, "choices", None) or []
+        if not choices:
+            return ""
+        msg = choices[0].message
+        content = getattr(msg, "content", None)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                elif getattr(block, "type", None) == "text":
+                    parts.append(getattr(block, "text", ""))
+            return " ".join(parts)
+    except Exception:
+        pass
+    return ""
+
+
+def _response_has_tool_call(response_obj) -> bool:
+    """Return True if the response contains any tool_use / tool_calls blocks."""
+    try:
+        choices = getattr(response_obj, "choices", None) or []
+        if not choices:
+            return False
+        msg = choices[0].message
+        # OpenAI format
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            return True
+        # Anthropic native content-block format
+        content = getattr(msg, "content", None)
+        if isinstance(content, list):
+            for block in content:
+                t = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+                if t == "tool_use":
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _detect_tool_hallucination(kwargs: dict, response_obj) -> tuple[bool, str | None]:
+    """Return (detected, matched_phrase) for silent tool-calling failures.
+
+    Fires when: tools were in the request, model returned no tool calls,
+    AND the response text contains a known denial phrase.
+    """
+    try:
+        if not _request_had_tools(kwargs):
+            return False, None
+        if _response_has_tool_call(response_obj):
+            return False, None
+        text = _extract_response_text(response_obj).lower()
+        if not text:
+            return False, None
+        for phrase in _TOOL_DENIAL_PHRASES:
+            if phrase in text:
+                return True, phrase
+    except Exception:
+        pass
+    return False, None
 
 
 _SESSION_HEADER_NAMES = ("x-session-id", "x-claude-session-id", "x-litellm-session-id")
@@ -99,10 +217,42 @@ class SessionLogger(CustomLogger):
     def __init__(self) -> None:
         super().__init__()
         self._lock = threading.Lock()
+        self._context_swapped: set[str] = set()  # call_ids that were model-swapped pre-call
         try:
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             log.warning("session_logger: cannot create log dir: %s", exc)
+
+    def _write_hallucination(self, kwargs: dict, response_obj, matched_phrase: str | None) -> None:
+        """Write a detailed record to the hallucination log for post-mortem."""
+        try:
+            text_snippet = _extract_response_text(response_obj)[:500]
+            psr = kwargs.get("proxy_server_request") or {}
+            body = psr.get("body") if isinstance(psr, dict) else {}
+            tool_names = [t.get("name") for t in (body.get("tools") or []) if isinstance(t, dict)] if isinstance(body, dict) else []
+            upstream = kwargs.get("model") or _safe_get(kwargs, "litellm_params", "model")
+            usage = {}
+            if hasattr(response_obj, "usage"):
+                try:
+                    u = response_obj.usage
+                    usage = u.model_dump() if hasattr(u, "model_dump") else dict(u or {})
+                except Exception:
+                    pass
+            entry = {
+                "ts": _now_iso(),
+                "upstream_model": upstream,
+                "matched_phrase": matched_phrase,
+                "prompt_tokens": usage.get("prompt_tokens") if isinstance(usage, dict) else None,
+                "tools_in_request": tool_names,
+                "response_text_snippet": text_snippet,
+                "request_id": kwargs.get("litellm_call_id"),
+            }
+            line = json.dumps(entry, default=str, ensure_ascii=False)
+            with self._lock:
+                with HALLUCINATION_LOG_PATH.open("a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+        except Exception as exc:
+            log.warning("session_logger: hallucination write failed: %s", exc)
 
     def _write(self, entry: dict) -> None:
         try:
@@ -113,7 +263,7 @@ class SessionLogger(CustomLogger):
         except Exception as exc:
             log.warning("session_logger: write failed: %s", exc)
 
-    def _build_entry(self, kwargs: dict, response_obj, start_time, end_time, status: str, error: str | None) -> dict:
+    def _build_entry(self, kwargs: dict, response_obj, start_time, end_time, status: str, error: str | None, tool_hallucination: bool | None = None) -> dict:
         try:
             latency_ms = (end_time - start_time).total_seconds() * 1000 if start_time and end_time else None
         except Exception:
@@ -173,7 +323,47 @@ class SessionLogger(CustomLogger):
             "user": user,
             "error": error,
             "call_type": kwargs.get("call_type"),
+            "tool_hallucination": tool_hallucination,
+            "context_fallback": True if kwargs.get("litellm_call_id") in self._context_swapped else None,
         }
+
+    # ── pre-call hook: context-aware model swap ───────────────────────
+
+    async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+        """Swap to a reliable fallback model when context is long and tools are present.
+
+        Budget models silently drop tool calls above ~120k tokens. By swapping
+        here — before the call is made — we prevent the failure entirely rather
+        than just logging it after the fact.
+        """
+        try:
+            if call_type != "completion":
+                return data
+            tools = data.get("tools")
+            if not tools:
+                return data
+            messages = data.get("messages") or []
+            char_count = sum(
+                len(str(m.get("content") or "")) for m in messages
+                if isinstance(m, dict)
+            )
+            estimated_tokens = char_count // 4
+            if estimated_tokens >= TOOL_CONTEXT_THRESHOLD:
+                original_model = data.get("model", "?")
+                data["model"] = TOOL_CONTEXT_FALLBACK_MODEL
+                call_id = data.get("litellm_call_id") or data.get("request_id")
+                if call_id:
+                    self._context_swapped.add(call_id)
+                    if len(self._context_swapped) > 500:
+                        # Prevent unbounded growth for long-running proxy processes
+                        self._context_swapped = set(list(self._context_swapped)[-250:])
+                log.warning(
+                    "context_fallback: %s → %s (~%dk tokens, tools present)",
+                    original_model, TOOL_CONTEXT_FALLBACK_MODEL, estimated_tokens // 1000,
+                )
+        except Exception as exc:
+            log.warning("context_fallback: pre_call_hook error: %s", exc)
+        return data
 
     # ── sync hooks (LiteLLM calls these directly for non-async paths) ─
 
@@ -203,7 +393,10 @@ class SessionLogger(CustomLogger):
                     dump_path.write_text(json.dumps(dump, indent=2, default=str), encoding="utf-8")
             except Exception:
                 pass
-            self._write(self._build_entry(kwargs, response_obj, start_time, end_time, "ok", None))
+            hallucination, matched_phrase = _detect_tool_hallucination(kwargs, response_obj)
+            self._write(self._build_entry(kwargs, response_obj, start_time, end_time, "ok", None, tool_hallucination=hallucination or None))
+            if hallucination:
+                self._write_hallucination(kwargs, response_obj, matched_phrase)
         except Exception as exc:
             log.warning("session_logger: success hook error: %s", exc)
 

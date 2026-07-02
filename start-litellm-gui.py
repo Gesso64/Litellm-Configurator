@@ -390,7 +390,7 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
     cd_host = f'cd "{project_dir}"; ' if project_dir else ""
     cd_ps = f'Set-Location "{project_dir}"; ' if project_dir else ""
 
-    # All box lines: inner width = 74, total = 76 (║ + 74 chars + ║)
+    # Horizontal separator line (no vertical borders — those break on some terminals)
     B = "══════════════════════════════════════════════════════════════════════════"
     role_lines = []
     for role_key, alias, label in ROLES:
@@ -400,26 +400,26 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
         alias_display = ", ".join([alias] + extras)
         if len(alias_display) > 35:
             alias_display = alias_display[:33] + ".."
-        role_lines.append(f"║  {label:10s}  {alias_display:<35s} →  {mid_display:<20s} ║")
+        role_lines.append(f"  {label:10s}  {alias_display:<35s} →  {mid_display:<20s}")
     role_block_ps = "".join(f'Write-Host "{line}"; ' for line in role_lines)
     role_block_bash = "".join(f'echo "{line}"; ' for line in role_lines)
 
     if platform.system() == "Windows":
-        ps_project_line = (f'Write-Host "║  Project: {project_dir:<62} ║"; ') if project_dir else ""
+        ps_project_line = (f'Write-Host "  Project: {project_dir}"; ') if project_dir else ""
         ps_command = (
             f'{cd_ps}'
             f'$env:ANTHROPIC_BASE_URL="{base_url}"; '
             f'$env:ANTHROPIC_API_KEY="sk-local-fake"; '
             f'Write-Host ""; '
-            f'Write-Host "╔{B}╗"; '
-            f'Write-Host "║               LiteLLM Proxy — Active Models                              ║"; '
-            f'Write-Host "╠{B}╣"; '
-            f'Write-Host "║  Port: {port:<65} ║"; '
+            f'Write-Host "{B}"; '
+            f'Write-Host "               LiteLLM Proxy - Active Models"; '
+            f'Write-Host "{B}"; '
+            f'Write-Host "  Port: {port}"; '
             f'{ps_project_line}'
             f'{role_block_ps}'
-            f'Write-Host "╠{B}╣"; '
-            f'Write-Host "║  Proxy running in background — env vars are set.                         ║"; '
-            f'Write-Host "╚{B}╝"; '
+            f'Write-Host "{B}"; '
+            f'Write-Host "  Proxy running in background - env vars are set."; '
+            f'Write-Host "{B}"; '
             f'Write-Host ""; '
             f'Write-Host "Press Enter to launch Claude Code, or type: claude"; '
             f'Read-Host; '
@@ -430,21 +430,21 @@ def open_terminal_with_env(models: dict, port: int, project_dir: str = "") -> No
             shell=True,
         )
     else:
-        bash_project_line = (f'echo "║  Project: {project_dir:<62} ║"; ') if project_dir else ""
+        bash_project_line = (f'echo "  Project: {project_dir}"; ') if project_dir else ""
         bash_script = (
             f'{cd_host}'
             f'export ANTHROPIC_BASE_URL="{base_url}"; '
             f'export ANTHROPIC_API_KEY="sk-local-fake"; '
             f'echo ""; '
-            f'echo "╔{B}╗"; '
-            f'echo "║               LiteLLM Proxy — Active Models                              ║"; '
-            f'echo "╠{B}╣"; '
-            f'echo "║  Port: {port:<65} ║"; '
+            f'echo "{B}"; '
+            f'echo "               LiteLLM Proxy - Active Models"; '
+            f'echo "{B}"; '
+            f'echo "  Port: {port}"; '
             f'{bash_project_line}'
             f'{role_block_bash}'
-            f'echo "╠{B}╣"; '
-            f'echo "║  Proxy running in background — env vars are set.                         ║"; '
-            f'echo "╚{B}╝"; '
+            f'echo "{B}"; '
+            f'echo "  Proxy running in background - env vars are set."; '
+            f'echo "{B}"; '
             f'echo ""; '
             f'read -p "Press Enter to launch Claude Code... "; '
             f'claude'
@@ -1092,7 +1092,7 @@ class SmoothScrollArea(QScrollArea):
 class SmoothListWidget(QListWidget):
     """QListWidget with animated, accumulating wheel scroll."""
 
-    _PX_PER_TICK = 1
+    _PX_PER_TICK = 1.5
     _DURATION_MS  = 150
 
     def __init__(self, parent=None):
@@ -1686,6 +1686,8 @@ class LiteLLMGui(QMainWindow):
             ("Latency check", "python tools/litellm_probe.py --latency"),
             ("Show the generated yaml", "Get-Content $env:USERPROFILE\\.claude\\litellm-select.yaml"),
             ("Open precall debug log", "Get-Content $env:USERPROFILE\\.claude\\litellm-precall-full.jsonl -Tail 5"),
+            ("Tool hallucination log", "Get-Content $env:USERPROFILE\\.claude\\litellm-tool-hallucination.jsonl -Tail 20 | ConvertFrom-Json | Select-Object ts, upstream_model, prompt_tokens, matched_phrase, response_text_snippet | Format-List"),
+            ("Context fallbacks in session log", "Get-Content $env:USERPROFILE\\.claude\\litellm-session-log.jsonl -Tail 500 | ConvertFrom-Json | Where-Object { $_.context_fallback } | Select-Object ts, upstream_model, prompt_tokens | Format-Table"),
             ("Kill any proxy on 4001", "Get-Process litellm -ErrorAction SilentlyContinue | Stop-Process -Force"),
         ]
         # Build a clickable list dialog.
